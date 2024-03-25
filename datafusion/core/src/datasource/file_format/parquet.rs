@@ -466,10 +466,12 @@ async fn fetch_statistics(
         file_metadata.key_value_metadata(),
     )?;
 
-    let mut file_schema_map = HashMap::with_capacity(file_schema.fields().len());
-    for (idx, field) in file_schema.fields().iter().enumerate() {
-        file_schema_map.insert(field.name(), idx);
-    }
+    let file_schema_map = file_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(idx, field)| (field.name(), idx))
+        .collect::<HashMap<_, _>>();
 
     let num_fields = table_schema.fields().len();
     let fields = table_schema.fields();

@@ -42,13 +42,6 @@ pub use file_scan_config::{
 pub use file_stream::{FileOpenFuture, FileOpener, FileStream, OnError};
 pub use json::{JsonOpener, NdJsonExec};
 
-use std::{
-    fmt::{Debug, Formatter, Result as FmtResult},
-    ops::Range,
-    sync::Arc,
-    vec,
-};
-use hashbrown::HashMap;
 use super::listing::ListingTableUrl;
 use crate::error::Result;
 use crate::physical_plan::{DisplayAs, DisplayFormatType};
@@ -58,6 +51,13 @@ use crate::{
         object_store::ObjectStoreUrl,
     },
     physical_plan::display::{display_orderings, ProjectSchemaDisplay},
+};
+use hashbrown::HashMap;
+use std::{
+    fmt::{Debug, Formatter, Result as FmtResult},
+    ops::Range,
+    sync::Arc,
+    vec,
 };
 
 use arrow::{
@@ -274,8 +274,7 @@ impl SchemaAdapter {
         file_schema_map: &HashMap<&String, usize>,
     ) -> Option<usize> {
         let field = self.table_schema.field(index);
-        let idx = file_schema_map.get(field.name()).unwrap();
-        Some(*idx)
+        Some(*file_schema_map.get(field.name())?)
     }
 
     /// Creates a `SchemaMapping` that can be used to cast or map the columns from the file schema to the table schema.
