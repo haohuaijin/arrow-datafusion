@@ -466,12 +466,7 @@ async fn fetch_statistics(
         file_metadata.key_value_metadata(),
     )?;
 
-    let file_schema_map = file_schema
-        .fields()
-        .iter()
-        .enumerate()
-        .map(|(idx, field)| (field.name(), idx))
-        .collect::<HashMap<_, _>>();
+    let mut file_schema_map = HashMap::new();
 
     let num_fields = table_schema.fields().len();
     let fields = table_schema.fields();
@@ -496,6 +491,15 @@ async fn fetch_statistics(
                 has_statistics = true;
                 column_stats.insert(i, (stat.null_count(), stat));
             }
+        }
+
+        if has_statistics && file_schema_map.is_empty() {
+            file_schema_map = file_schema
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(idx, field)| (field.name(), idx))
+                .collect::<HashMap<_, _>>();
         }
 
         if has_statistics {
