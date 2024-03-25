@@ -466,7 +466,7 @@ async fn fetch_statistics(
         file_metadata.key_value_metadata(),
     )?;
 
-    let mut file_schema_map = HashMap::new();
+    let mut file_schema_map = HashMap::with_capacity(file_schema.fields().len());
     for (idx, field) in file_schema.fields().iter().enumerate() {
         file_schema_map.insert(field.name(), idx);
     }
