@@ -48,7 +48,7 @@ use std::{
     sync::Arc,
     vec,
 };
-
+use hashbrown::HashMap;
 use super::listing::ListingTableUrl;
 use crate::error::Result;
 use crate::physical_plan::{DisplayAs, DisplayFormatType};
@@ -271,10 +271,11 @@ impl SchemaAdapter {
     pub(crate) fn map_column_index(
         &self,
         index: usize,
-        file_schema: &Schema,
+        file_schema_map: &HashMap<&String, usize>,
     ) -> Option<usize> {
         let field = self.table_schema.field(index);
-        Some(file_schema.fields.find(field.name())?.0)
+        let idx = file_schema_map.get(field.name()).unwrap();
+        Some(*idx)
     }
 
     /// Creates a `SchemaMapping` that can be used to cast or map the columns from the file schema to the table schema.

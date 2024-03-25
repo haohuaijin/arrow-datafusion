@@ -466,6 +466,11 @@ async fn fetch_statistics(
         file_metadata.key_value_metadata(),
     )?;
 
+    let mut file_schema_map = HashMap::new();
+    for (idx, field) in file_schema.fields().iter().enumerate() {
+        file_schema_map.insert(field.name(), idx);
+    }
+
     let num_fields = table_schema.fields().len();
     let fields = table_schema.fields();
 
@@ -494,7 +499,7 @@ async fn fetch_statistics(
         if has_statistics {
             for (table_idx, null_cnt) in null_counts.iter_mut().enumerate() {
                 if let Some(file_idx) =
-                    schema_adapter.map_column_index(table_idx, &file_schema)
+                    schema_adapter.map_column_index(table_idx, &file_schema_map)
                 {
                     if let Some((null_count, stats)) = column_stats.get(&file_idx) {
                         *null_cnt = null_cnt.add(&Precision::Exact(*null_count as usize));
