@@ -110,15 +110,6 @@ pub(crate) struct GroupedHashAggregateStream {
     accumulators: Vec<Box<dyn GroupsAccumulator>>,
 
     // ========================================================================
-    // TASK-SPECIFIC STATES:
-    // Inner states groups together properties, states for a specific task.
-    // ========================================================================
-    /// Optional ordering information, that might allow groups to be
-    /// emitted from the hash table prior to seeing the end of the
-    /// input
-    group_ordering: GroupOrdering,
-
-    // ========================================================================
     // EXECUTION RESOURCES:
     // Fields related to managing execution resources and monitoring performance.
     // ========================================================================
@@ -197,7 +188,6 @@ impl GroupedHashAggregateStream {
             exec_state,
             baseline_metrics,
             batch_size,
-            group_ordering,
             input_done: false,
         })
     }
@@ -244,7 +234,7 @@ impl Stream for GroupedHashAggregateStream {
 
         loop {
             match &self.exec_state {
-                ExecutionState::ReadingInput => 'reading_input: {
+                ExecutionState::ReadingInput => {
                     match ready!(self.input.poll_next_unpin(cx)) {
                         // New batch to aggregate in partial aggregation operator
                         Some(Ok(batch)) if self.mode == AggregateMode::Partial => {
@@ -256,18 +246,6 @@ impl Stream for GroupedHashAggregateStream {
                             // If we can begin emitting rows, do so,
                             // otherwise keep consuming input
                             assert!(!self.input_done);
-
-                            if let Some(to_emit) = self.group_ordering.emit_to() {
-                                timer.done();
-                                if let Some(batch) =
-                                    extract_ok!(self.emit(to_emit, false))
-                                {
-                                    self.exec_state =
-                                        ExecutionState::ProducingOutput(batch);
-                                };
-                                // make sure the exec_state just set is not overwritten below
-                                break 'reading_input;
-                            }
 
                             extract_ok!(self.emit_early_if_necessary());
 
@@ -285,18 +263,6 @@ impl Stream for GroupedHashAggregateStream {
                             // If we can begin emitting rows, do so,
                             // otherwise keep consuming input
                             assert!(!self.input_done);
-
-                            if let Some(to_emit) = self.group_ordering.emit_to() {
-                                timer.done();
-                                if let Some(batch) =
-                                    extract_ok!(self.emit(to_emit, false))
-                                {
-                                    self.exec_state =
-                                        ExecutionState::ProducingOutput(batch);
-                                };
-                                // make sure the exec_state just set is not overwritten below
-                                break 'reading_input;
-                            }
 
                             timer.done();
                         }
@@ -373,20 +339,12 @@ impl GroupedHashAggregateStream {
 
         for group_values in &group_by_values {
             // calculate the group indices for each input row
-            let starting_num_groups = self.group_values.len();
             self.group_values
                 .intern(group_values, &mut self.current_group_indices)?;
             let group_indices = &self.current_group_indices;
 
             // Update ordering information if necessary
             let total_num_groups = self.group_values.len();
-            if total_num_groups > starting_num_groups {
-                self.group_ordering.new_groups(
-                    group_values,
-                    group_indices,
-                    total_num_groups,
-                )?;
-            }
 
             // Gather the inputs to call the actual accumulator
             let t = self.accumulators.iter_mut().zip(input_values.iter());
@@ -424,9 +382,7 @@ impl GroupedHashAggregateStream {
     fn update_memory_reservation(&mut self) -> Result<()> {
         let acc = self.accumulators.iter().map(|x| x.size()).sum::<usize>();
         let reservation_result = self.reservation.try_resize(
-            acc + self.group_values.size()
-                + self.group_ordering.size()
-                + self.current_group_indices.allocated_size(),
+            acc + self.group_values.size() + self.current_group_indices.allocated_size(),
         );
 
         reservation_result
@@ -441,9 +397,6 @@ impl GroupedHashAggregateStream {
         }
 
         let mut output = self.group_values.emit(emit_to)?;
-        if let EmitTo::First(n) = emit_to {
-            self.group_ordering.remove_groups(n);
-        }
 
         // Next output each aggregate value
         for acc in self.accumulators.iter_mut() {
@@ -487,7 +440,6 @@ impl GroupedHashAggregateStream {
     /// TODO: support group_ordering for early emitting
     fn emit_early_if_necessary(&mut self) -> Result<()> {
         if self.group_values.len() >= self.batch_size
-            && matches!(self.group_ordering, GroupOrdering::None)
             && self.update_memory_reservation().is_err()
         {
             assert_eq!(self.mode, AggregateMode::Partial);
@@ -502,7 +454,6 @@ impl GroupedHashAggregateStream {
     /// common function for signalling end of processing of the input stream
     fn set_input_done_and_produce_output(&mut self) -> Result<()> {
         self.input_done = true;
-        self.group_ordering.input_done();
         let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
         let timer = elapsed_compute.timer();
         let batch = self.emit(EmitTo::All, false)?;
