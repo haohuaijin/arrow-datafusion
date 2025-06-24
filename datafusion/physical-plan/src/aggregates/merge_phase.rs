@@ -388,7 +388,7 @@ impl GroupedHashAggregateStream {
 
     /// Create an output RecordBatch with the group keys and
     /// accumulator states/values specified in emit_to
-    fn emit(&mut self, emit_to: EmitTo, spilling: bool) -> Result<Option<RecordBatch>> {
+    fn emit(&mut self, emit_to: EmitTo) -> Result<Option<RecordBatch>> {
         let schema = self.schema();
         if self.group_values.is_empty() {
             return Ok(None);
@@ -400,11 +400,6 @@ impl GroupedHashAggregateStream {
         for acc in self.accumulators.iter_mut() {
             match self.mode {
                 AggregateMode::Partial => output.extend(acc.state(emit_to)?),
-                _ if spilling => {
-                    // If spilling, output partial state because the spilled data will be
-                    // merged and re-evaluated later.
-                    output.extend(acc.state(emit_to)?)
-                }
                 AggregateMode::Final
                 | AggregateMode::FinalPartitioned
                 | AggregateMode::Single
@@ -442,7 +437,7 @@ impl GroupedHashAggregateStream {
         {
             assert_eq!(self.mode, AggregateMode::Partial);
             let n = self.group_values.len() / self.batch_size * self.batch_size;
-            if let Some(batch) = self.emit(EmitTo::First(n), false)? {
+            if let Some(batch) = self.emit(EmitTo::First(n))? {
                 self.exec_state = ExecutionState::ProducingOutput(batch);
             };
         }
@@ -454,7 +449,7 @@ impl GroupedHashAggregateStream {
         self.input_done = true;
         let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
         let timer = elapsed_compute.timer();
-        let batch = self.emit(EmitTo::All, false)?;
+        let batch = self.emit(EmitTo::All)?;
         self.exec_state =
             batch.map_or(ExecutionState::Done, ExecutionState::ProducingOutput);
         timer.done();
