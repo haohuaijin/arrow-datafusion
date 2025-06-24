@@ -140,8 +140,6 @@ impl GroupedHashAggregateStream {
 
         let aggregate_exprs = agg.aggr_expr.clone();
 
-        // arguments for each aggregate, one vec of expressions per
-        // aggregate
         let aggregate_arguments = aggregates::aggregate_expressions(
             &agg.aggr_expr,
             &agg.mode,
@@ -462,31 +460,4 @@ impl GroupedHashAggregateStream {
         timer.done();
         Ok(())
     }
-
-    // /// Transforms input batch to intermediate aggregate state, without grouping it
-    // fn transform_to_states(&self, batch: RecordBatch) -> Result<RecordBatch> {
-    //     let mut group_values = evaluate_group_by(&self.group_by, &batch)?;
-    //     let input_values = evaluate_many(&self.aggregate_arguments, &batch)?;
-    //     let filter_values = evaluate_optional(&self.filter_expressions, &batch)?;
-
-    //     if group_values.len() != 1 {
-    //         return internal_err!("group_values expected to have single element");
-    //     }
-    //     let mut output = group_values.swap_remove(0);
-
-    //     let iter = self
-    //         .accumulators
-    //         .iter()
-    //         .zip(input_values.iter())
-    //         .zip(filter_values.iter());
-
-    //     for ((acc, values), opt_filter) in iter {
-    //         let opt_filter = opt_filter.as_ref().map(|filter| filter.as_boolean());
-    //         output.extend(acc.convert_to_state(values, opt_filter)?);
-    //     }
-
-    //     let states_batch = RecordBatch::try_new(self.schema(), output)?;
-
-    //     Ok(states_batch)
-    // }
 }
