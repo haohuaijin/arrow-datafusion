@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow::array::{RecordBatch, StringArray};
+use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion::datasource::MemTable;
@@ -17,9 +17,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = SessionContext::new_with_config(config);
 
     let table = create_memtable()?;
-    ctx.register_table("default", Arc::new(table))?;
+    ctx.register_table("cdn_production", Arc::new(table))?;
 
-    let sql = "select clientip, count(*) as cnt from default group by clientip order by cnt desc limit 3";
+    let sql = "select clientrequestpath, count(_timestamp) as cnt from cdn_production group by clientrequestpath order by cnt desc limit 3";
     let plan = ctx.state().create_logical_plan(&sql).await?;
     let physical_plan = ctx.state().create_physical_plan(&plan).await?;
 
@@ -34,12 +34,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let start = std::time::Instant::now();
     let file = File::open(
-        "/Users/huaijinhao/Downloads/arrow/1750330800000000_1750334400000000.arrow",
+        "/Users/huaijinhao/Downloads/big/1750809600000000_1750831200000000.arrow",
     )?;
     let reader = arrow::ipc::reader::FileReader::try_new(file, None)?;
+    let mut record_batchs = Vec::new();
     for batch in reader {
-        group_hash_aggregate_stream.group_aggregate_batch(batch.unwrap())?;
+        record_batchs.push(batch?);
     }
+
+    println!("record_batchs.len: {}", record_batchs.len()); // 6286
+
+    for batch in record_batchs.into_iter().skip(1500) {
+        group_hash_aggregate_stream.group_aggregate_batch(batch)?;
+    }
+
     let result = group_hash_aggregate_stream.get_final_result()?;
 
     let mut result_vec = Vec::new();
@@ -48,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // write to disk
-    let file = File::create("/Users/huaijinhao/Downloads/arrow/result.arrow")?;
+    let file = File::create("/Users/huaijinhao/Downloads/big/result.arrow")?;
     let mut writer =
         arrow::ipc::writer::FileWriter::try_new(file, &partial_plan.schema())?;
     for batch in result_vec {
@@ -143,16 +151,25 @@ fn create_memtable() -> Result<MemTable> {
 fn create_record_batch() -> Result<Vec<RecordBatch>> {
     let id_array = StringArray::from(vec!["127.0.0.1"]);
     let name_array = StringArray::from(vec!["zhangsan"]);
+    let timestamp_array = Int64Array::from(vec![1750330800000000]);
 
     Ok(vec![
         RecordBatch::try_new(
             get_schema(),
-            vec![Arc::new(id_array.clone()), Arc::new(name_array.clone())],
+            vec![
+                Arc::new(id_array.clone()),
+                Arc::new(timestamp_array.clone()),
+                Arc::new(name_array.clone()),
+            ],
         )
         .unwrap(),
         RecordBatch::try_new(
             get_schema(),
-            vec![Arc::new(id_array), Arc::new(name_array)],
+            vec![
+                Arc::new(id_array),
+                Arc::new(timestamp_array),
+                Arc::new(name_array),
+            ],
         )
         .unwrap(),
     ])
@@ -160,7 +177,8 @@ fn create_record_batch() -> Result<Vec<RecordBatch>> {
 
 fn get_schema() -> SchemaRef {
     SchemaRef::new(Schema::new(vec![
+        Field::new("clientrequestpath", DataType::Utf8, false),
+        Field::new("_timestamp", DataType::Int64, false),
         Field::new("clientip", DataType::Utf8, false),
-        Field::new("name", DataType::Utf8, false),
     ]))
 }
