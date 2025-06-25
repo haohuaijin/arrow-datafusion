@@ -116,7 +116,7 @@ impl GroupedHashAggregateStream {
     /// Create a new GroupedHashAggregateStream
     pub fn new(agg: &AggregateExec, context: Arc<TaskContext>) -> Result<Self> {
         debug!("Creating GroupedHashAggregateStream");
-        let agg_schema = agg.input_schema();
+        let agg_schema = agg.input().schema();
         let agg_group_by = agg.group_by.clone();
 
         let baseline_metrics = BaselineMetrics::new(&agg.metrics, 0);
