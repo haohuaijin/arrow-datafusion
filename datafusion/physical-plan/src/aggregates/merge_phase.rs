@@ -25,7 +25,7 @@ use crate::aggregates::{
     evaluate_group_by, evaluate_many, AggregateMode, PhysicalGroupBy,
 };
 use crate::metrics::{BaselineMetrics, RecordOutput};
-use crate::{aggregates, ExecutionPlan, PhysicalExpr};
+use crate::{aggregates, PhysicalExpr};
 use crate::{RecordBatchStream, SendableRecordBatchStream};
 
 use arrow::array::*;
@@ -55,7 +55,7 @@ pub(crate) enum ExecutionState {
     Done,
 }
 
-pub(crate) struct GroupedHashAggregateStream {
+pub struct GroupedHashAggregateStream {
     // ========================================================================
     // PROPERTIES:
     // These fields are initialized at the start and remain constant throughout
@@ -126,15 +126,16 @@ impl GroupedHashAggregateStream {
     pub fn new(
         agg: &AggregateExec,
         context: Arc<TaskContext>,
-        partition: usize,
+        input: SendableRecordBatchStream,
+        schema: SchemaRef,
     ) -> Result<Self> {
         debug!("Creating GroupedHashAggregateStream");
-        let agg_schema = Arc::clone(&agg.schema);
+        let agg_schema = schema;
         let agg_group_by = agg.group_by.clone();
 
         let batch_size = context.session_config().batch_size();
-        let input = agg.input.execute(partition, Arc::clone(&context))?;
-        let baseline_metrics = BaselineMetrics::new(&agg.metrics, partition);
+        // let input = agg.input.execute(partition, Arc::clone(&context))?;
+        let baseline_metrics = BaselineMetrics::new(&agg.metrics, 0);
 
         let timer = baseline_metrics.elapsed_compute().timer();
 
@@ -154,21 +155,12 @@ impl GroupedHashAggregateStream {
 
         let group_schema = agg_group_by.group_schema(&agg.input().schema())?;
 
-        let name = format!("GroupedHashAggregateStream[{partition}]");
+        let name = format!("GroupedHashAggregateStream[]");
         let reservation = MemoryConsumer::new(name)
             .with_can_spill(true)
             .register(context.memory_pool());
-        let (ordering, _) = agg
-            .properties()
-            .equivalence_properties()
-            .find_longest_permutation(&agg_group_by.output_exprs());
-        let group_ordering = GroupOrdering::try_new(
-            &group_schema,
-            &agg.input_order_mode,
-            ordering.as_ref(),
-        )?;
 
-        let group_values = new_group_values(group_schema, &group_ordering)?;
+        let group_values = new_group_values(group_schema, &GroupOrdering::None)?;
         timer.done();
 
         let exec_state = ExecutionState::ReadingInput;
@@ -398,13 +390,14 @@ impl GroupedHashAggregateStream {
 
         // Next output each aggregate value
         for acc in self.accumulators.iter_mut() {
-            match self.mode {
-                AggregateMode::Partial => output.extend(acc.state(emit_to)?),
-                AggregateMode::Final
-                | AggregateMode::FinalPartitioned
-                | AggregateMode::Single
-                | AggregateMode::SinglePartitioned => output.push(acc.evaluate(emit_to)?),
-            }
+            // match self.mode {
+            //     AggregateMode::Partial => output.extend(acc.state(emit_to)?),
+            //     AggregateMode::Final
+            //     | AggregateMode::FinalPartitioned
+            //     | AggregateMode::Single
+            //     | AggregateMode::SinglePartitioned => output.push(acc.evaluate(emit_to)?),
+            // }
+            output.extend(acc.state(emit_to)?);
         }
 
         // emit reduces the memory usage. Ignore Err from update_memory_reservation. Even if it is
