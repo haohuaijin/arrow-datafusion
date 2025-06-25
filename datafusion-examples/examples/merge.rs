@@ -23,14 +23,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let plan = ctx.state().create_logical_plan(&sql).await?;
     let physical_plan = ctx.state().create_physical_plan(&plan).await?;
 
-    let partial_plan = get_partial_aggregate_plan(physical_plan.clone());
     let final_plan = get_final_aggregate_plan(physical_plan.clone());
 
-    let mut group_hash_aggregate_stream = GroupedHashAggregateStream::new(
-        &final_plan,
-        ctx.task_ctx(),
-        partial_plan.schema(),
-    )?;
+    let mut group_hash_aggregate_stream =
+        GroupedHashAggregateStream::new(&final_plan, ctx.task_ctx())?;
 
     let start = std::time::Instant::now();
     let file = File::open(
@@ -57,8 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // write to disk
     let file = File::create("/Users/huaijinhao/Downloads/big/result.arrow")?;
-    let mut writer =
-        arrow::ipc::writer::FileWriter::try_new(file, &partial_plan.schema())?;
+    let mut writer = arrow::ipc::writer::FileWriter::try_new(file, &result.schema())?;
     for batch in result_vec {
         writer.write(&batch)?;
     }
@@ -69,19 +64,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn get_partial_aggregate_plan(plan: Arc<dyn ExecutionPlan>) -> AggregateExec {
-    let mut visitor = AggregateVisitor::new(true);
-    let _ = plan.visit(&mut visitor);
-    let data = visitor.get_data();
-    data.unwrap()
-        .as_any()
-        .downcast_ref::<AggregateExec>()
-        .unwrap()
-        .clone()
-}
-
 fn get_final_aggregate_plan(plan: Arc<dyn ExecutionPlan>) -> AggregateExec {
-    let mut visitor = AggregateVisitor::new(false);
+    let mut visitor = AggregateVisitor::new();
     let _ = plan.visit(&mut visitor);
     let data = visitor.get_data();
     data.unwrap()
@@ -92,16 +76,12 @@ fn get_final_aggregate_plan(plan: Arc<dyn ExecutionPlan>) -> AggregateExec {
 }
 
 pub struct AggregateVisitor {
-    is_partial: bool,
     data: Option<Arc<dyn ExecutionPlan>>,
 }
 
 impl AggregateVisitor {
-    pub fn new(is_partial: bool) -> Self {
-        Self {
-            is_partial,
-            data: None,
-        }
+    pub fn new() -> Self {
+        Self { data: None }
     }
 
     pub fn get_data(&self) -> Option<&Arc<dyn ExecutionPlan>> {
@@ -111,7 +91,7 @@ impl AggregateVisitor {
 
 impl Default for AggregateVisitor {
     fn default() -> Self {
-        Self::new(false)
+        Self::new()
     }
 }
 
@@ -121,22 +101,13 @@ impl<'n> TreeNodeVisitor<'n> for AggregateVisitor {
     fn f_up(&mut self, node: &'n Self::Node) -> Result<TreeNodeRecursion> {
         if node.name() == "AggregateExec" {
             let agg = node.as_any().downcast_ref::<AggregateExec>().unwrap();
-            if self.is_partial {
-                if *agg.mode() == AggregateMode::Partial {
-                    self.data = Some(node.clone());
-                    Ok(TreeNodeRecursion::Stop)
-                } else {
-                    Ok(TreeNodeRecursion::Continue)
-                }
+            if *agg.mode() == AggregateMode::Final
+                || *agg.mode() == AggregateMode::FinalPartitioned
+            {
+                self.data = Some(node.clone());
+                Ok(TreeNodeRecursion::Stop)
             } else {
-                if *agg.mode() == AggregateMode::Final
-                    || *agg.mode() == AggregateMode::FinalPartitioned
-                {
-                    self.data = Some(node.clone());
-                    Ok(TreeNodeRecursion::Stop)
-                } else {
-                    Ok(TreeNodeRecursion::Continue)
-                }
+                Ok(TreeNodeRecursion::Continue)
             }
         } else {
             Ok(TreeNodeRecursion::Continue)

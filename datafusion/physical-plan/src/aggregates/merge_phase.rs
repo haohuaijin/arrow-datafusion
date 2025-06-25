@@ -114,14 +114,9 @@ pub struct GroupedHashAggregateStream {
 
 impl GroupedHashAggregateStream {
     /// Create a new GroupedHashAggregateStream
-    #[allow(dead_code)]
-    pub fn new(
-        agg: &AggregateExec,
-        context: Arc<TaskContext>,
-        schema: SchemaRef,
-    ) -> Result<Self> {
+    pub fn new(agg: &AggregateExec, context: Arc<TaskContext>) -> Result<Self> {
         debug!("Creating GroupedHashAggregateStream");
-        let agg_schema = schema;
+        let agg_schema = agg.input_schema();
         let agg_group_by = agg.group_by.clone();
 
         let baseline_metrics = BaselineMetrics::new(&agg.metrics, 0);
