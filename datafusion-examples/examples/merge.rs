@@ -1,18 +1,14 @@
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use arrow::array::{RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion::datasource::MemTable;
-use datafusion::error::{DataFusionError, Result};
-use datafusion::execution::RecordBatchStream;
+use datafusion::error::Result;
 use datafusion::physical_plan::aggregates::merge_phase::GroupedHashAggregateStream;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::*;
-use futures::{Stream, StreamExt};
 use std::fs::File;
 
 #[tokio::main]
@@ -23,7 +19,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let table = create_memtable()?;
     ctx.register_table("default", Arc::new(table))?;
 
-    let start = std::time::Instant::now();
     let sql = "select clientip, count(*) as cnt from default group by clientip order by cnt desc limit 3";
     let plan = ctx.state().create_logical_plan(&sql).await?;
     let physical_plan = ctx.state().create_physical_plan(&plan).await?;
@@ -31,36 +26,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let partial_plan = get_partial_aggregate_plan(physical_plan.clone());
     let final_plan = get_final_aggregate_plan(physical_plan.clone());
 
-    let stream = ArrowRecordBatchStream::new(
-        get_schema(),
-        "/Users/huaijinhao/Downloads/arrow/1750330800000000_1750334400000000.arrow",
-    )?;
     let mut group_hash_aggregate_stream = GroupedHashAggregateStream::new(
         &final_plan,
         ctx.task_ctx(),
-        Box::pin(stream),
         partial_plan.schema(),
     )?;
 
-    // get result from group_hash_aggregate_stream
-    let mut result = Vec::new();
-    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-    while let Poll::Ready(Some(batch)) =
-        group_hash_aggregate_stream.poll_next_unpin(&mut cx)
-    {
-        result.push(batch.unwrap());
+    let start = std::time::Instant::now();
+    let file = File::open(
+        "/Users/huaijinhao/Downloads/arrow/1750330800000000_1750334400000000.arrow",
+    )?;
+    let reader = arrow::ipc::reader::FileReader::try_new(file, None)?;
+    for batch in reader {
+        group_hash_aggregate_stream.group_aggregate_batch(batch.unwrap())?;
+    }
+    let result = group_hash_aggregate_stream.get_final_result()?;
+
+    let mut result_vec = Vec::new();
+    for i in 0..result.num_rows() / 8192 {
+        result_vec.push(result.slice(i * 8192, 8192));
     }
 
     // write to disk
     let file = File::create("/Users/huaijinhao/Downloads/arrow/result.arrow")?;
     let mut writer =
         arrow::ipc::writer::FileWriter::try_new(file, &partial_plan.schema())?;
-    for batch in result {
+    for batch in result_vec {
         writer.write(&batch)?;
     }
     writer.finish()?;
 
-    // let ret = datafusion::physical_plan::collect(physical_plan.clone(), ctx.task_ctx()).await?;
     println!("Frist Time: {:?}", start.elapsed());
 
     Ok(())
@@ -168,50 +163,4 @@ fn get_schema() -> SchemaRef {
         Field::new("clientip", DataType::Utf8, false),
         Field::new("name", DataType::Utf8, false),
     ]))
-}
-
-struct ArrowRecordBatchStream {
-    schema: SchemaRef,
-    reader: arrow::ipc::reader::FileReader<File>,
-    current_batch: Option<RecordBatch>,
-}
-
-impl ArrowRecordBatchStream {
-    pub fn new(
-        schema: SchemaRef,
-        file_path: &str,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let file = File::open(file_path)?;
-        let reader = arrow::ipc::reader::FileReader::try_new(file, None)?;
-        Ok(Self {
-            schema,
-            reader,
-            current_batch: None,
-        })
-    }
-}
-
-impl Stream for ArrowRecordBatchStream {
-    type Item = Result<RecordBatch, DataFusionError>;
-
-    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-
-        if this.current_batch.is_none() {
-            if let Some(batch) = this.reader.next() {
-                this.current_batch = Some(batch.unwrap());
-            } else {
-                return Poll::Ready(None);
-            }
-        }
-
-        let batch = this.current_batch.take();
-        Poll::Ready(Some(Ok(batch.unwrap())))
-    }
-}
-
-impl RecordBatchStream for ArrowRecordBatchStream {
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
 }

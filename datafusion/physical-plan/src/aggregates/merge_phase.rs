@@ -18,15 +18,13 @@
 //! Hash aggregation
 
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use crate::aggregates::group_values::{new_group_values, GroupValues};
 use crate::aggregates::{
     evaluate_group_by, evaluate_many, AggregateMode, PhysicalGroupBy,
 };
-use crate::metrics::{BaselineMetrics, RecordOutput};
+use crate::metrics::BaselineMetrics;
 use crate::{aggregates, PhysicalExpr};
-use crate::{RecordBatchStream, SendableRecordBatchStream};
 
 use arrow::array::*;
 use arrow::datatypes::SchemaRef;
@@ -40,8 +38,6 @@ use datafusion_physical_expr::GroupsAccumulatorAdapter;
 use super::order::GroupOrdering;
 use super::AggregateExec;
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
-use futures::ready;
-use futures::stream::{Stream, StreamExt};
 use log::debug;
 
 #[derive(Debug, Clone)]
@@ -62,7 +58,6 @@ pub struct GroupedHashAggregateStream {
     // the execution.
     // ========================================================================
     schema: SchemaRef,
-    input: SendableRecordBatchStream,
     mode: AggregateMode,
 
     /// Arguments to pass to each accumulator.
@@ -76,9 +71,6 @@ pub struct GroupedHashAggregateStream {
 
     /// GROUP BY expressions
     group_by: PhysicalGroupBy,
-
-    /// max rows in output RecordBatches
-    batch_size: usize,
 
     // ========================================================================
     // STATE FLAGS:
@@ -126,15 +118,12 @@ impl GroupedHashAggregateStream {
     pub fn new(
         agg: &AggregateExec,
         context: Arc<TaskContext>,
-        input: SendableRecordBatchStream,
         schema: SchemaRef,
     ) -> Result<Self> {
         debug!("Creating GroupedHashAggregateStream");
         let agg_schema = schema;
         let agg_group_by = agg.group_by.clone();
 
-        let batch_size = context.session_config().batch_size();
-        // let input = agg.input.execute(partition, Arc::clone(&context))?;
         let baseline_metrics = BaselineMetrics::new(&agg.metrics, 0);
 
         let timer = baseline_metrics.elapsed_compute().timer();
@@ -155,9 +144,9 @@ impl GroupedHashAggregateStream {
 
         let group_schema = agg_group_by.group_schema(&agg.input().schema())?;
 
-        let name = format!("GroupedHashAggregateStream[]");
+        let name = format!("GroupedHashAggregateStream[merge_to_disk]");
         let reservation = MemoryConsumer::new(name)
-            .with_can_spill(true)
+            .with_can_spill(false)
             .register(context.memory_pool());
 
         let group_values = new_group_values(group_schema, &GroupOrdering::None)?;
@@ -167,7 +156,6 @@ impl GroupedHashAggregateStream {
 
         Ok(GroupedHashAggregateStream {
             schema: agg_schema,
-            input,
             mode: agg.mode,
             accumulators,
             aggregate_arguments,
@@ -177,9 +165,12 @@ impl GroupedHashAggregateStream {
             current_group_indices: Default::default(),
             exec_state,
             baseline_metrics,
-            batch_size,
             input_done: false,
         })
+    }
+
+    pub fn schema(&self) -> SchemaRef {
+        self.schema.clone()
     }
 }
 
@@ -203,124 +194,9 @@ pub(crate) fn create_group_accumulator(
     }
 }
 
-/// Extracts a successful Ok(_) or returns Poll::Ready(Some(Err(e))) with errors
-macro_rules! extract_ok {
-    ($RES: expr) => {{
-        match $RES {
-            Ok(v) => v,
-            Err(e) => return Poll::Ready(Some(Err(e))),
-        }
-    }};
-}
-
-impl Stream for GroupedHashAggregateStream {
-    type Item = Result<RecordBatch>;
-
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
-
-        loop {
-            match &self.exec_state {
-                ExecutionState::ReadingInput => {
-                    match ready!(self.input.poll_next_unpin(cx)) {
-                        // New batch to aggregate in partial aggregation operator
-                        Some(Ok(batch)) if self.mode == AggregateMode::Partial => {
-                            let timer = elapsed_compute.timer();
-
-                            // Do the grouping
-                            extract_ok!(self.group_aggregate_batch(batch));
-
-                            // If we can begin emitting rows, do so,
-                            // otherwise keep consuming input
-                            assert!(!self.input_done);
-
-                            extract_ok!(self.emit_early_if_necessary());
-
-                            timer.done();
-                        }
-
-                        // New batch to aggregate in terminal aggregation operator
-                        // (Final/FinalPartitioned/Single/SinglePartitioned)
-                        Some(Ok(batch)) => {
-                            let timer = elapsed_compute.timer();
-
-                            // Do the grouping
-                            extract_ok!(self.group_aggregate_batch(batch));
-
-                            // If we can begin emitting rows, do so,
-                            // otherwise keep consuming input
-                            assert!(!self.input_done);
-
-                            timer.done();
-                        }
-
-                        // Found error from input stream
-                        Some(Err(e)) => {
-                            // inner had error, return to caller
-                            return Poll::Ready(Some(Err(e)));
-                        }
-
-                        // Found end from input stream
-                        None => {
-                            // inner is done, emit all rows and switch to producing output
-                            extract_ok!(self.set_input_done_and_produce_output());
-                        }
-                    }
-                }
-
-                ExecutionState::ProducingOutput(batch) => {
-                    // slice off a part of the batch, if needed
-                    let output_batch;
-                    let size = self.batch_size;
-                    (self.exec_state, output_batch) = if batch.num_rows() <= size {
-                        (
-                            if self.input_done {
-                                ExecutionState::Done
-                            } else {
-                                ExecutionState::ReadingInput
-                            },
-                            batch.clone(),
-                        )
-                    } else {
-                        // output first batch_size rows
-                        let size = self.batch_size;
-                        let num_remaining = batch.num_rows() - size;
-                        let remaining = batch.slice(size, num_remaining);
-                        let output = batch.slice(0, size);
-                        (ExecutionState::ProducingOutput(remaining), output)
-                    };
-                    // Empty record batches should not be emitted.
-                    // They need to be treated as  [`Option<RecordBatch>`]es and handled separately
-                    debug_assert!(output_batch.num_rows() > 0);
-                    return Poll::Ready(Some(Ok(
-                        output_batch.record_output(&self.baseline_metrics)
-                    )));
-                }
-
-                ExecutionState::Done => {
-                    // release the memory reservation since sending back output batch itself needs
-                    // some memory reservation, so make some room for it.
-                    self.clear_all();
-                    let _ = self.update_memory_reservation();
-                    return Poll::Ready(None);
-                }
-            }
-        }
-    }
-}
-
-impl RecordBatchStream for GroupedHashAggregateStream {
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-}
-
 impl GroupedHashAggregateStream {
     /// Perform group-by aggregation for the given [`RecordBatch`].
-    fn group_aggregate_batch(&mut self, batch: RecordBatch) -> Result<()> {
+    pub fn group_aggregate_batch(&mut self, batch: RecordBatch) -> Result<()> {
         // Evaluate the grouping expressions
         let group_by_values = evaluate_group_by(&self.group_by, &batch)?;
 
@@ -360,11 +236,7 @@ impl GroupedHashAggregateStream {
         match self.update_memory_reservation() {
             // Here we can ignore `insufficient_capacity_err` because we will spill later,
             // but at least one batch should fit in the memory
-            Err(DataFusionError::ResourcesExhausted(_))
-                if self.group_values.len() >= self.batch_size =>
-            {
-                Ok(())
-            }
+            Err(DataFusionError::ResourcesExhausted(_)) => Ok(()),
             other => other,
         }
     }
@@ -390,13 +262,6 @@ impl GroupedHashAggregateStream {
 
         // Next output each aggregate value
         for acc in self.accumulators.iter_mut() {
-            // match self.mode {
-            //     AggregateMode::Partial => output.extend(acc.state(emit_to)?),
-            //     AggregateMode::Final
-            //     | AggregateMode::FinalPartitioned
-            //     | AggregateMode::Single
-            //     | AggregateMode::SinglePartitioned => output.push(acc.evaluate(emit_to)?),
-            // }
             output.extend(acc.state(emit_to)?);
         }
 
@@ -421,22 +286,6 @@ impl GroupedHashAggregateStream {
         self.clear_shrink(&RecordBatch::new_empty(s));
     }
 
-    /// Emit if the used memory exceeds the target for partial aggregation.
-    /// Currently only [`GroupOrdering::None`] is supported for early emitting.
-    /// TODO: support group_ordering for early emitting
-    fn emit_early_if_necessary(&mut self) -> Result<()> {
-        if self.group_values.len() >= self.batch_size
-            && self.update_memory_reservation().is_err()
-        {
-            assert_eq!(self.mode, AggregateMode::Partial);
-            let n = self.group_values.len() / self.batch_size * self.batch_size;
-            if let Some(batch) = self.emit(EmitTo::First(n))? {
-                self.exec_state = ExecutionState::ProducingOutput(batch);
-            };
-        }
-        Ok(())
-    }
-
     /// common function for signalling end of processing of the input stream
     fn set_input_done_and_produce_output(&mut self) -> Result<()> {
         self.input_done = true;
@@ -447,5 +296,15 @@ impl GroupedHashAggregateStream {
             batch.map_or(ExecutionState::Done, ExecutionState::ProducingOutput);
         timer.done();
         Ok(())
+    }
+
+    pub fn get_final_result(&mut self) -> Result<RecordBatch> {
+        self.set_input_done_and_produce_output()?;
+        let batch = match &self.exec_state {
+            ExecutionState::ProducingOutput(batch) => batch.clone(),
+            _ => panic!("Not producing output"),
+        };
+        self.clear_all();
+        Ok(batch)
     }
 }
