@@ -19,18 +19,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let table = create_memtable()?;
     ctx.register_table("cdn_production", Arc::new(table))?;
 
-    let sql = "select clientrequestpath, count(_timestamp) as cnt from cdn_production group by clientrequestpath order by cnt desc limit 3";
+    let sql = "select clientip, count(*) as cnt from cdn_production group by clientip order by cnt desc limit 3";
     let plan = ctx.state().create_logical_plan(&sql).await?;
     let physical_plan = ctx.state().create_physical_plan(&plan).await?;
 
     let final_plan = get_final_aggregate_plan(physical_plan.clone());
 
-    let mut group_hash_aggregate_stream =
-        GroupedHashAggregateStream::new(&final_plan, ctx.task_ctx())?;
+    let mut group_hash_aggregate_stream = GroupedHashAggregateStream::new(&final_plan)?;
 
     let start = std::time::Instant::now();
     let file = File::open(
-        "/Users/huaijinhao/Downloads/big/1750809600000000_1750831200000000.arrow",
+        "/Users/huaijinhao/Downloads/1750330800000000_1750334400000000.arrow",
     )?;
     let reader = arrow::ipc::reader::FileReader::try_new(file, None)?;
     let mut record_batchs = Vec::new();
@@ -40,26 +39,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("record_batchs.len: {}", record_batchs.len()); // 6286
 
-    for batch in record_batchs.into_iter().skip(1500) {
+    for batch in record_batchs.into_iter() {
         group_hash_aggregate_stream.group_aggregate_batch(batch)?;
     }
 
     let result = group_hash_aggregate_stream.get_final_result()?;
 
-    let mut result_vec = Vec::new();
-    for i in 0..result.num_rows() / 8192 {
-        result_vec.push(result.slice(i * 8192, 8192));
-    }
-
     // write to disk
-    let file = File::create("/Users/huaijinhao/Downloads/big/result.arrow")?;
-    let mut writer = arrow::ipc::writer::FileWriter::try_new(file, &result.schema())?;
-    for batch in result_vec {
+    let file = File::create("/Users/huaijinhao/Downloads/result.arrow")?;
+    let mut writer = arrow::ipc::writer::FileWriter::try_new(file, &result[0].schema())?;
+    for batch in result {
         writer.write(&batch)?;
     }
     writer.finish()?;
 
-    println!("Frist Time: {:?}", start.elapsed());
+    println!("Time: {:?}", start.elapsed());
 
     Ok(())
 }
