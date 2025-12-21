@@ -503,6 +503,9 @@ pub struct AggregateExec {
     filter_expr: Vec<Option<Arc<dyn PhysicalExpr>>>,
     /// Set if the output of this aggregation is truncated by a upstream sort/limit clause
     limit: Option<usize>,
+    /// If limit is set, this indicates the ordering direction (true = descending, false = ascending)
+    /// This is used for TopK aggregation to maintain a priority queue with the correct ordering
+    limit_order_descending: Option<bool>,
     /// Input plan, could be a partial aggregate or the input to the aggregate
     pub input: Arc<dyn ExecutionPlan>,
     /// Schema after the aggregate is applied
@@ -547,6 +550,7 @@ impl AggregateExec {
             group_by: self.group_by.clone(),
             filter_expr: self.filter_expr.clone(),
             limit: self.limit,
+            limit_order_descending: self.limit_order_descending,
             input: Arc::clone(&self.input),
             schema: Arc::clone(&self.schema),
             input_schema: Arc::clone(&self.input_schema),
@@ -677,6 +681,7 @@ impl AggregateExec {
             metrics: ExecutionPlanMetricsSet::new(),
             required_input_ordering,
             limit: None,
+            limit_order_descending: None,
             input_order_mode,
             cache,
             dynamic_filter: None,
@@ -696,6 +701,22 @@ impl AggregateExec {
     pub fn with_limit(mut self, limit: Option<usize>) -> Self {
         self.limit = limit;
         self
+    }
+
+    /// Set the `limit` and ordering direction for TopK aggregation
+    pub fn with_limit_and_order(
+        mut self,
+        limit: Option<usize>,
+        descending: Option<bool>,
+    ) -> Self {
+        self.limit = limit;
+        self.limit_order_descending = descending;
+        self
+    }
+
+    /// Get the ordering direction for the limit (if set)
+    pub fn limit_order_descending(&self) -> Option<bool> {
+        self.limit_order_descending
     }
     /// Grouping expressions
     pub fn group_expr(&self) -> &PhysicalGroupBy {
@@ -1145,6 +1166,9 @@ impl DisplayAs for AggregateExec {
                 }
                 if !a.is_empty() {
                     writeln!(f, "aggr={}", a.join(", "))?;
+                }
+                if let Some(limit) = self.limit {
+                    writeln!(f, "limit={limit}")?;
                 }
             }
         }

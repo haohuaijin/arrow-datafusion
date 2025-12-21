@@ -65,13 +65,24 @@ impl GroupedTopKAggregateStream {
         let group_by_metrics = GroupByMetrics::new(&aggr.metrics, partition);
         let aggregate_arguments =
             aggregate_expressions(&aggr.aggr_expr, &aggr.mode, group_by.expr.len())?;
-        let (val_field, desc) = aggr
-            .get_minmax_desc()
-            .ok_or_else(|| internal_datafusion_err!("Min/max required"))?;
 
         let (expr, _) = &aggr.group_expr().expr()[0];
         let kt = expr.data_type(&aggr.input().schema())?;
-        let vt = val_field.data_type().clone();
+
+        // Check if this is a MIN/MAX aggregate or a DISTINCT-like operation
+        let (vt, desc) = if let Some((val_field, desc)) = aggr.get_minmax_desc() {
+            // MIN/MAX case: use the aggregate output type
+            (val_field.data_type().clone(), desc)
+        } else {
+            // DISTINCT case: use the group key type and get ordering from limit_order_descending
+            // The ordering direction is set by the optimizer when it pushes down the limit
+            let desc = aggr.limit_order_descending().ok_or_else(|| {
+                internal_datafusion_err!(
+                    "Ordering direction required for DISTINCT with limit"
+                )
+            })?;
+            (kt.clone(), desc)
+        };
 
         let priority_map = PriorityMap::new(kt, vt, limit, desc)?;
 
@@ -154,18 +165,21 @@ impl Stream for GroupedTopKAggregateStream {
                         "Exactly 1 group value required"
                     );
                     let group_by_values = Arc::clone(&group_by_values[0][0]);
-                    let input_values = {
-                        let _timer = (!self.aggregate_arguments.is_empty()).then(|| {
-                            self.group_by_metrics.aggregate_arguments_time.timer()
-                        });
-                        evaluate_many(
+                    let input_values = if self.aggregate_arguments.is_empty() {
+                        // DISTINCT case: use group key as both key and value
+                        Arc::clone(&group_by_values)
+                    } else {
+                        // MIN/MAX case: evaluate aggregate expressions
+                        let _timer =
+                            self.group_by_metrics.aggregate_arguments_time.timer();
+                        let input_values = evaluate_many(
                             &self.aggregate_arguments,
                             batches.first().unwrap(),
-                        )?
+                        )?;
+                        assert_eq!(input_values.len(), 1, "Exactly 1 input required");
+                        assert_eq!(input_values[0].len(), 1, "Exactly 1 input required");
+                        Arc::clone(&input_values[0][0])
                     };
-                    assert_eq!(input_values.len(), 1, "Exactly 1 input required");
-                    assert_eq!(input_values[0].len(), 1, "Exactly 1 input required");
-                    let input_values = Arc::clone(&input_values[0][0]);
 
                     // iterate over each column of group_by values
                     (*self).intern(&group_by_values, &input_values)?;
