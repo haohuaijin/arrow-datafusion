@@ -316,10 +316,21 @@ impl FileOpener for ParquetOpener {
                 && file_pruner.should_prune()?
             {
                 // Return an empty stream immediately to skip the work of setting up the actual stream
+                log::info!(
+                    "[FILE_PRUNE_INITIAL] Pruned file at open time: {}, predicate: {:?}",
+                    file_name,
+                    predicate.as_ref().map(|p| format!("{}", p))
+                );
                 file_metrics.files_ranges_pruned_statistics.add_pruned(1);
                 return Ok(futures::stream::empty().boxed());
             }
 
+            log::info!(
+                "[FILE_OPEN] Opening file: {}, has_file_pruner: {}, predicate: {:?}",
+                file_name,
+                file_pruner.is_some(),
+                predicate.as_ref().map(|p| format!("{}", p))
+            );
             file_metrics.files_ranges_pruned_statistics.add_matched(1);
 
             // Don't load the page index yet. Since it is not stored inline in
@@ -433,6 +444,11 @@ impl FileOpener for ParquetOpener {
 
             // Filter pushdown: evaluate predicates during scan
             if let Some(predicate) = pushdown_filters.then_some(predicate).flatten() {
+                log::info!(
+                    "[FILTER_PUSHDOWN] Building row filter for file: {}, predicate: {:?}",
+                    file_name,
+                    predicate
+                );
                 let row_filter = row_filter::build_row_filter(
                     &predicate,
                     &physical_file_schema,
@@ -443,15 +459,30 @@ impl FileOpener for ParquetOpener {
 
                 match row_filter {
                     Ok(Some(filter)) => {
+                        log::info!(
+                            "[FILTER_PUSHDOWN] Successfully created row filter for file: {}",
+                            file_name
+                        );
                         builder = builder.with_row_filter(filter);
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        log::info!(
+                            "[FILTER_PUSHDOWN] No row filter created for file: {}",
+                            file_name
+                        );
+                    }
                     Err(e) => {
                         debug!(
                             "Ignoring error building row filter for '{predicate:?}': {e}"
                         );
                     }
                 };
+            } else {
+                log::info!(
+                    "[FILTER_PUSHDOWN] Disabled for file: {}, pushdown_filters: {}",
+                    file_name,
+                    pushdown_filters
+                );
             };
             if force_filter_selections {
                 builder =
@@ -474,6 +505,7 @@ impl FileOpener for ParquetOpener {
 
             // If there is a predicate that can be evaluated against the metadata
             if let Some(predicate) = predicate.as_ref() {
+                let rg_before_stats = row_groups.remaining_row_group_count();
                 if enable_row_group_stats_pruning {
                     row_groups.prune_by_statistics(
                         &physical_file_schema,
@@ -481,6 +513,14 @@ impl FileOpener for ParquetOpener {
                         rg_metadata,
                         predicate,
                         &file_metrics,
+                    );
+                    let rg_after_stats = row_groups.remaining_row_group_count();
+                    log::info!(
+                        "[RG_STATS_PRUNE] File: {}, row_groups before: {}, after: {}, pruned: {}",
+                        file_name,
+                        rg_before_stats,
+                        rg_after_stats,
+                        rg_before_stats - rg_after_stats
                     );
                 } else {
                     // Update metrics: statistics unavailable, so all row groups are
@@ -743,6 +783,10 @@ where
         // Since dynamic filters may have been updated, see if we can stop
         // reading this stream entirely.
         if self.file_pruner.should_prune()? {
+            log::info!(
+                "[FILE_PRUNE_DYNAMIC] Early stopping file after reading batch, total_rows_seen: {}",
+                batch.num_rows()
+            );
             self.files_ranges_pruned_statistics.add_pruned(1);
             // Previously this file range has been counted as matched
             self.files_ranges_pruned_statistics.subtract_matched(1);

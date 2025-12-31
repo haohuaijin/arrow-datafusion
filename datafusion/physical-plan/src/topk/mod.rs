@@ -229,6 +229,14 @@ impl TopK {
     /// the top k seen so far.
     #[expect(clippy::needless_pass_by_value)]
     pub fn insert_batch(&mut self, batch: RecordBatch) -> Result<()> {
+        let batch_arrival_time = std::time::Instant::now();
+        log::info!(
+            "[TOPK_BATCH_ARRIVE] Batch arrived at TopK, num_rows: {}, heap_size: {}/{}",
+            batch.num_rows(),
+            self.heap.inner.len(),
+            self.heap.k
+        );
+
         // Updates on drop
         let baseline = self.metrics.baseline.clone();
         let _timer = baseline.elapsed_compute().timer();
@@ -308,7 +316,23 @@ impl TopK {
             self.attempt_early_completion(&batch)?;
 
             // update the filter representation of our TopK heap
+            let update_start = std::time::Instant::now();
             self.update_filter()?;
+            let update_took = update_start.elapsed();
+
+            log::info!(
+                "[TOPK_BATCH_COMPLETE] Batch processing complete, replacements: {}, update_filter_time: {:?}, total_batch_time: {:?}, heap_size: {}/{}",
+                replacements,
+                update_took,
+                batch_arrival_time.elapsed(),
+                self.heap.inner.len(),
+                self.heap.k
+            );
+        } else {
+            log::info!(
+                "[TOPK_BATCH_COMPLETE] Batch processing complete, replacements: 0, total_batch_time: {:?}",
+                batch_arrival_time.elapsed()
+            );
         }
 
         Ok(())
@@ -349,6 +373,7 @@ impl TopK {
     fn update_filter(&mut self) -> Result<()> {
         // If the heap doesn't have k elements yet, we can't create thresholds
         let Some(max_row) = self.heap.max() else {
+            log::info!("[TOPK_FILTER_UPDATE] Heap not full yet, no filter update");
             return Ok(());
         };
 
@@ -369,8 +394,11 @@ impl TopK {
 
         // exit early if the current values are better
         if !needs_update {
+            log::info!("[TOPK_FILTER_UPDATE] Current filter already better, no update needed");
             return Ok(());
         }
+
+        log::info!("[TOPK_FILTER_UPDATE] Updating filter - heap is full and new threshold is better");
 
         // Extract scalar values BEFORE acquiring lock to reduce critical section
         let thresholds = match self.heap.get_threshold_values(&self.expr)? {
@@ -412,7 +440,17 @@ impl TopK {
         if let Some(pred) = predicate
             && !pred.eq(&lit(true))
         {
+            let before_gen = filter.expr.snapshot_generation();
             filter.expr.update(pred)?;
+            let after_gen = filter.expr.snapshot_generation();
+            log::info!(
+                "[TOPK_FILTER_UPDATE] DynamicFilter expression updated! generation: {} -> {}, threshold_values: {:?}",
+                before_gen,
+                after_gen,
+                thresholds
+            );
+        } else {
+            log::info!("[TOPK_FILTER_UPDATE] No predicate to update (trivial filter)");
         }
 
         Ok(())
