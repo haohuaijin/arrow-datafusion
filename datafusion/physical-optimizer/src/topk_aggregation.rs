@@ -74,6 +74,10 @@ impl TopKAggregation {
                 return None;
             }
         } else if aggr.aggr_expr().is_empty() {
+            // TODO: remove this after https://github.com/apache/datafusion/issues/19219
+            if !kt.is_primitive() {
+                return None;
+            }
             // This is a GROUP BY without aggregates (DISTINCT-like operation)
             // Check if ordering is on the group key itself
             if order_by != group_key_alias {
