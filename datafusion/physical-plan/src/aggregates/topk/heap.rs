@@ -17,12 +17,14 @@
 
 //! A custom binary heap implementation for performant top K aggregation
 
-use arrow::array::{ArrayRef, ArrowPrimitiveType, PrimitiveArray, downcast_primitive};
+use arrow::array::{
+    Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray, downcast_primitive,
+};
 use arrow::array::{
     cast::AsArray,
     types::{IntervalDayTime, IntervalMonthDayNano},
 };
-use arrow::buffer::ScalarBuffer;
+use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, i256};
 use datafusion_common::Result;
 use datafusion_common::exec_datafusion_err;
@@ -85,24 +87,24 @@ pub trait ArrowHeap {
 /// An implementation of `ArrowHeap` that deals with primitive values
 pub struct PrimitiveHeap<VAL: ArrowPrimitiveType>
 where
-    <VAL as ArrowPrimitiveType>::Native: Comparable,
+    Option<<VAL as ArrowPrimitiveType>::Native>: Comparable,
 {
     batch: ArrayRef,
-    heap: TopKHeap<VAL::Native>,
-    desc: bool,
+    heap: TopKHeap<Option<VAL::Native>>,
+    sort_options: SortOptions,
     data_type: DataType,
 }
 
 impl<VAL: ArrowPrimitiveType> PrimitiveHeap<VAL>
 where
-    <VAL as ArrowPrimitiveType>::Native: Comparable,
+    Option<<VAL as ArrowPrimitiveType>::Native>: Comparable,
 {
-    pub fn new(limit: usize, desc: bool, data_type: DataType) -> Self {
+    pub fn new(limit: usize, sort_options: SortOptions, data_type: DataType) -> Self {
         let owned: ArrayRef = Arc::new(PrimitiveArray::<VAL>::builder(0).finish());
         Self {
             batch: owned,
-            heap: TopKHeap::new(limit, desc),
-            desc,
+            heap: TopKHeap::new(limit, sort_options.descending),
+            sort_options,
             data_type,
         }
     }
@@ -110,7 +112,7 @@ where
 
 impl<VAL: ArrowPrimitiveType> ArrowHeap for PrimitiveHeap<VAL>
 where
-    <VAL as ArrowPrimitiveType>::Native: Comparable,
+    Option<<VAL as ArrowPrimitiveType>::Native>: Comparable,
 {
     fn set_batch(&mut self, vals: ArrayRef) {
         self.batch = vals;
@@ -121,9 +123,40 @@ where
             return false;
         }
         let vals = self.batch.as_primitive::<VAL>();
-        let new_val = vals.value(row_idx);
+        let new_val = if vals.is_null(row_idx) {
+            None
+        } else {
+            Some(vals.value(row_idx))
+        };
         let worst_val = self.heap.worst_val().expect("Missing root");
-        (!self.desc && new_val > *worst_val) || (self.desc && new_val < *worst_val)
+
+        // Apply NULL ordering based on sort_options
+        // For SQL semantics:
+        // - NULLS FIRST means NULL < any value (NULL is "smaller")
+        // - NULLS LAST means NULL > any value (NULL is "larger")
+        let cmp = match (&new_val, worst_val) {
+            (Some(a), Some(b)) => Some(*a).comp(&Some(*b)),
+            (Some(_), None) => {
+                // new_val is non-NULL, worst_val is NULL
+                if self.sort_options.nulls_first {
+                    Ordering::Greater // non-NULL > NULL
+                } else {
+                    Ordering::Less // non-NULL < NULL
+                }
+            }
+            (None, Some(_)) => {
+                // new_val is NULL, worst_val is non-NULL
+                if self.sort_options.nulls_first {
+                    Ordering::Less // NULL < non-NULL
+                } else {
+                    Ordering::Greater // NULL > non-NULL
+                }
+            }
+            (None, None) => Ordering::Equal,
+        };
+
+        (!self.sort_options.descending && cmp == Ordering::Greater)
+            || (self.sort_options.descending && cmp == Ordering::Less)
     }
 
     fn worst_map_idx(&self) -> usize {
@@ -132,7 +165,11 @@ where
 
     fn insert(&mut self, row_idx: usize, map_idx: usize, map: &mut Vec<(usize, usize)>) {
         let vals = self.batch.as_primitive::<VAL>();
-        let new_val = vals.value(row_idx);
+        let new_val = if vals.is_null(row_idx) {
+            None
+        } else {
+            Some(vals.value(row_idx))
+        };
         self.heap.append_or_replace(new_val, map_idx, map);
     }
 
@@ -143,15 +180,66 @@ where
         map: &mut Vec<(usize, usize)>,
     ) {
         let vals = self.batch.as_primitive::<VAL>();
-        let new_val = vals.value(row_idx);
-        self.heap.replace_if_better(heap_idx, new_val, map);
+        let new_val = if vals.is_null(row_idx) {
+            None
+        } else {
+            Some(vals.value(row_idx))
+        };
+
+        // For MIN/MAX aggregation: non-NULL values always replace NULL values
+        // This implements standard SQL semantics where MIN/MAX ignore NULL values
+        let existing_item = self.heap.heap[heap_idx]
+            .as_ref()
+            .expect("Missing heap item");
+        let existing_val = &existing_item.val;
+
+        // Apply SQL NULL ordering for comparison
+        let should_replace = match (&new_val, existing_val) {
+            (Some(a), Some(b)) => {
+                let cmp = Some(*a).comp(&Some(*b));
+                if self.sort_options.descending {
+                    cmp == Ordering::Greater
+                } else {
+                    cmp == Ordering::Less
+                }
+            }
+            (Some(_), None) => {
+                // new is non-NULL, existing is NULL
+                // For MIN/MAX: non-NULL always better than NULL
+                // But we also need to check sort order
+                // For MIN (ASC): non-NULL can be better if it's smaller than other values
+                // For MAX (DESC): non-NULL can be better if it's larger than other values
+                // Since existing is NULL, non-NULL is always "better" for aggregation
+                true
+            }
+            (None, Some(_)) => {
+                // new is NULL, existing is non-NULL
+                // For MIN/MAX: NULL never replaces non-NULL
+                false
+            }
+            (None, None) => false, // Both NULL, no need to replace
+        };
+
+        if should_replace {
+            let existing = &mut self.heap.heap[heap_idx]
+                .as_mut()
+                .expect("Missing heap item")
+                .val;
+            *existing = new_val;
+            self.heap.heapify_down(heap_idx, map);
+        }
     }
 
     fn drain(&mut self) -> (ArrayRef, Vec<usize>) {
-        let nulls = None;
         let (vals, map_idxs) = self.heap.drain();
-        let arr = PrimitiveArray::<VAL>::new(ScalarBuffer::from(vals), nulls)
-            .with_data_type(self.data_type.clone());
+        let mut builder = PrimitiveArray::<VAL>::builder(vals.len());
+        for val in vals {
+            match val {
+                Some(v) => builder.append_value(v),
+                None => builder.append_null(),
+            }
+        }
+        let arr = builder.finish().with_data_type(self.data_type.clone());
         (Arc::new(arr), map_idxs)
     }
 }
@@ -245,22 +333,6 @@ impl<VAL: ValueType> TopKHeap<VAL> {
         hi.val = new_val;
         hi.map_idx = map_idx;
         self.heapify_down(0, mapper);
-    }
-
-    pub fn replace_if_better(
-        &mut self,
-        heap_idx: usize,
-        new_val: VAL,
-        mapper: &mut Vec<(usize, usize)>,
-    ) {
-        let existing = self.heap[heap_idx].as_mut().expect("Missing heap item");
-        if (!self.desc && new_val.comp(&existing.val) != Ordering::Less)
-            || (self.desc && new_val.comp(&existing.val) != Ordering::Greater)
-        {
-            return;
-        }
-        existing.val = new_val;
-        self.heapify_down(heap_idx, mapper);
     }
 
     fn heapify_up(&mut self, mut idx: usize, mapper: &mut Vec<(usize, usize)>) {
@@ -402,8 +474,8 @@ macro_rules! compare_float {
             fn comp(&self, other: &Self) -> Ordering {
                 match (self, other) {
                     (Some(me), Some(other)) => me.total_cmp(other),
-                    (Some(_), None) => Ordering::Greater,
-                    (None, Some(_)) => Ordering::Less,
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
                     (None, None) => Ordering::Equal,
                 }
             }
@@ -421,7 +493,12 @@ macro_rules! compare_integer {
     ($($t:ty),+) => {
         $(impl Comparable for Option<$t> {
             fn comp(&self, other: &Self) -> Ordering {
-                self.cmp(other)
+                match (self, other) {
+                    (Some(me), Some(other)) => me.cmp(other),
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => Ordering::Equal,
+                }
             }
         })+
 
@@ -440,12 +517,12 @@ compare_float!(f16, f32, f64);
 
 pub fn new_heap(
     limit: usize,
-    desc: bool,
+    sort_options: SortOptions,
     vt: DataType,
 ) -> Result<Box<dyn ArrowHeap + Send>> {
     macro_rules! downcast_helper {
         ($vt:ty, $d:ident) => {
-            return Ok(Box::new(PrimitiveHeap::<$vt>::new(limit, desc, vt)))
+            return Ok(Box::new(PrimitiveHeap::<$vt>::new(limit, sort_options, vt)))
         };
     }
 
@@ -519,37 +596,6 @@ mod tests {
         └── val=0 idx=2, bucket=0
         ");
         assert_eq!(map, vec![(2, 0), (0, 2)]);
-
-        Ok(())
-    }
-
-    #[test]
-    fn should_replace() -> Result<()> {
-        let mut map = vec![];
-        let mut heap = TopKHeap::new(4, false);
-
-        heap.append_or_replace(1, 1, &mut map);
-        heap.append_or_replace(2, 2, &mut map);
-        heap.append_or_replace(3, 3, &mut map);
-        heap.append_or_replace(4, 4, &mut map);
-        let actual = heap.to_string();
-        assert_snapshot!(actual, @r"
-        val=4 idx=0, bucket=4
-        ├── val=3 idx=1, bucket=3
-        │   └── val=1 idx=3, bucket=1
-        └── val=2 idx=2, bucket=2
-        ");
-
-        let mut map = vec![];
-        heap.replace_if_better(1, 0, &mut map);
-        let actual = heap.to_string();
-        assert_snapshot!(actual, @r"
-        val=4 idx=0, bucket=4
-        ├── val=1 idx=1, bucket=1
-        │   └── val=0 idx=3, bucket=3
-        └── val=2 idx=2, bucket=2
-        ");
-        assert_eq!(map, vec![(1, 1), (3, 3)]);
 
         Ok(())
     }

@@ -65,7 +65,7 @@ impl GroupedTopKAggregateStream {
         let group_by_metrics = GroupByMetrics::new(&aggr.metrics, partition);
         let aggregate_arguments =
             aggregate_expressions(&aggr.aggr_expr, &aggr.mode, group_by.expr.len())?;
-        let (val_field, desc) = aggr
+        let (val_field, _desc) = aggr
             .get_minmax_desc()
             .ok_or_else(|| internal_datafusion_err!("Min/max required"))?;
 
@@ -73,7 +73,10 @@ impl GroupedTopKAggregateStream {
         let kt = expr.data_type(&aggr.input().schema())?;
         let vt = val_field.data_type().clone();
 
-        let priority_map = PriorityMap::new(kt, vt, limit, desc)?;
+        // Get sort options from aggr, or use defaults based on DESC/ASC
+        let sort_options = aggr.sort_options.expect("Sort options are required");
+
+        let priority_map = PriorityMap::new(kt, vt, limit, sort_options)?;
 
         Ok(GroupedTopKAggregateStream {
             partition,
@@ -104,11 +107,7 @@ impl GroupedTopKAggregateStream {
         self.priority_map
             .set_batch(Arc::clone(ids), Arc::clone(vals));
 
-        let has_nulls = vals.null_count() > 0;
         for row_idx in 0..len {
-            if has_nulls && vals.is_null(row_idx) {
-                continue;
-            }
             self.priority_map.insert(row_idx)?;
         }
         Ok(())

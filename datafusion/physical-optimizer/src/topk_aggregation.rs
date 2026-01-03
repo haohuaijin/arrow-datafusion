@@ -20,6 +20,7 @@
 use std::sync::Arc;
 
 use crate::PhysicalOptimizerRule;
+use arrow::compute::SortOptions;
 use arrow::datatypes::DataType;
 use datafusion_common::Result;
 use datafusion_common::config::ConfigOptions;
@@ -45,12 +46,19 @@ impl TopKAggregation {
     fn transform_agg(
         aggr: &AggregateExec,
         order_by: &str,
-        order_desc: bool,
+        sort_options: SortOptions,
         limit: usize,
     ) -> Option<Arc<dyn ExecutionPlan>> {
         // ensure the sort direction matches aggregate function
         let (field, desc) = aggr.get_minmax_desc()?;
-        if desc != order_desc {
+        if desc != sort_options.descending {
+            return None;
+        }
+
+        // For now, only support default NULL ordering (DESC NULLS FIRST, ASC NULLS LAST)
+        // TODO: Support non-default NULL ordering (ASC NULLS FIRST, DESC NULLS LAST)
+        let default_nulls_first = desc; // DESC defaults to NULLS FIRST, ASC to NULLS LAST
+        if sort_options.nulls_first != default_nulls_first {
             return None;
         }
         let group_key = aggr.group_expr().expr().iter().exactly_one().ok()?;
@@ -71,7 +79,7 @@ impl TopKAggregation {
             return None;
         }
 
-        // We found what we want: clone, copy the limit down, and return modified node
+        // We found what we want: clone, copy the limit and sort options down, and return modified node
         let new_aggr = AggregateExec::try_new(
             *aggr.mode(),
             aggr.group_expr().clone(),
@@ -81,7 +89,8 @@ impl TopKAggregation {
             aggr.input_schema(),
         )
         .expect("Unable to copy Aggregate!")
-        .with_limit(Some(limit));
+        .with_limit(Some(limit))
+        .with_sort_options(Some(sort_options));
         Some(Arc::new(new_aggr))
     }
 
@@ -92,7 +101,7 @@ impl TopKAggregation {
         let child = children.into_iter().exactly_one().ok()?;
         let order = sort.properties().output_ordering()?;
         let order = order.iter().exactly_one().ok()?;
-        let order_desc = order.options.descending;
+        let sort_options = order.options;
         let order = order.expr.as_any().downcast_ref::<Column>()?;
         let mut cur_col_name = order.name().to_string();
         let limit = sort.fetch()?;
@@ -104,7 +113,7 @@ impl TopKAggregation {
             }
             if let Some(aggr) = plan.as_any().downcast_ref::<AggregateExec>() {
                 // either we run into an Aggregate and transform it
-                match Self::transform_agg(aggr, &cur_col_name, order_desc, limit) {
+                match Self::transform_agg(aggr, &cur_col_name, sort_options, limit) {
                     None => cardinality_preserved = false,
                     Some(plan) => return Ok(Transformed::yes(plan)),
                 }

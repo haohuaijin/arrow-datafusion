@@ -20,6 +20,7 @@
 use crate::aggregates::topk::hash_table::{ArrowHashTable, new_hash_table};
 use crate::aggregates::topk::heap::{ArrowHeap, new_heap};
 use arrow::array::ArrayRef;
+use arrow::compute::SortOptions;
 use arrow::datatypes::DataType;
 use datafusion_common::Result;
 
@@ -36,11 +37,11 @@ impl PriorityMap {
         key_type: DataType,
         val_type: DataType,
         capacity: usize,
-        descending: bool,
+        sort_options: SortOptions,
     ) -> Result<Self> {
         Ok(Self {
             map: new_hash_table(capacity, key_type)?,
-            heap: new_heap(capacity, descending, val_type)?,
+            heap: new_heap(capacity, sort_options, val_type)?,
             capacity,
             mapper: Vec::with_capacity(capacity),
         })
@@ -106,7 +107,15 @@ mod tests {
     fn should_append_with_utf8view() -> Result<()> {
         let ids: ArrayRef = Arc::new(StringViewArray::from(vec!["1"]));
         let vals: ArrayRef = Arc::new(Int64Array::from(vec![1]));
-        let mut agg = PriorityMap::new(DataType::Utf8View, DataType::Int64, 1, false)?;
+        let mut agg = PriorityMap::new(
+            DataType::Utf8View,
+            DataType::Int64,
+            1,
+            SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        )?;
         agg.set_batch(ids, vals);
         agg.insert(0)?;
 
@@ -133,7 +142,15 @@ mod tests {
     fn should_append_with_large_utf8() -> Result<()> {
         let ids: ArrayRef = Arc::new(LargeStringArray::from(vec!["1"]));
         let vals: ArrayRef = Arc::new(Int64Array::from(vec![1]));
-        let mut agg = PriorityMap::new(DataType::LargeUtf8, DataType::Int64, 1, false)?;
+        let mut agg = PriorityMap::new(
+            DataType::LargeUtf8,
+            DataType::Int64,
+            1,
+            SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        )?;
         agg.set_batch(ids, vals);
         agg.insert(0)?;
 
@@ -160,7 +177,15 @@ mod tests {
     fn should_append() -> Result<()> {
         let ids: ArrayRef = Arc::new(StringArray::from(vec!["1"]));
         let vals: ArrayRef = Arc::new(Int64Array::from(vec![1]));
-        let mut agg = PriorityMap::new(DataType::Utf8, DataType::Int64, 1, false)?;
+        let mut agg = PriorityMap::new(
+            DataType::Utf8,
+            DataType::Int64,
+            1,
+            SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        )?;
         agg.set_batch(ids, vals);
         agg.insert(0)?;
 
@@ -184,7 +209,15 @@ mod tests {
     fn should_ignore_higher_group() -> Result<()> {
         let ids: ArrayRef = Arc::new(StringArray::from(vec!["1", "2"]));
         let vals: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
-        let mut agg = PriorityMap::new(DataType::Utf8, DataType::Int64, 1, false)?;
+        let mut agg = PriorityMap::new(
+            DataType::Utf8,
+            DataType::Int64,
+            1,
+            SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        )?;
         agg.set_batch(ids, vals);
         agg.insert(0)?;
         agg.insert(1)?;
@@ -209,7 +242,15 @@ mod tests {
     fn should_ignore_lower_group() -> Result<()> {
         let ids: ArrayRef = Arc::new(StringArray::from(vec!["2", "1"]));
         let vals: ArrayRef = Arc::new(Int64Array::from(vec![2, 1]));
-        let mut agg = PriorityMap::new(DataType::Utf8, DataType::Int64, 1, true)?;
+        let mut agg = PriorityMap::new(
+            DataType::Utf8,
+            DataType::Int64,
+            1,
+            SortOptions {
+                descending: true,
+                nulls_first: true,
+            },
+        )?;
         agg.set_batch(ids, vals);
         agg.insert(0)?;
         agg.insert(1)?;
@@ -233,7 +274,15 @@ mod tests {
     fn should_ignore_higher_same_group() -> Result<()> {
         let ids: ArrayRef = Arc::new(StringArray::from(vec!["1", "1"]));
         let vals: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
-        let mut agg = PriorityMap::new(DataType::Utf8, DataType::Int64, 2, false)?;
+        let mut agg = PriorityMap::new(
+            DataType::Utf8,
+            DataType::Int64,
+            2,
+            SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        )?;
         agg.set_batch(ids, vals);
         agg.insert(0)?;
         agg.insert(1)?;
@@ -257,7 +306,15 @@ mod tests {
     fn should_ignore_lower_same_group() -> Result<()> {
         let ids: ArrayRef = Arc::new(StringArray::from(vec!["1", "1"]));
         let vals: ArrayRef = Arc::new(Int64Array::from(vec![2, 1]));
-        let mut agg = PriorityMap::new(DataType::Utf8, DataType::Int64, 2, true)?;
+        let mut agg = PriorityMap::new(
+            DataType::Utf8,
+            DataType::Int64,
+            2,
+            SortOptions {
+                descending: true,
+                nulls_first: true,
+            },
+        )?;
         agg.set_batch(ids, vals);
         agg.insert(0)?;
         agg.insert(1)?;
@@ -281,7 +338,15 @@ mod tests {
     fn should_accept_lower_group() -> Result<()> {
         let ids: ArrayRef = Arc::new(StringArray::from(vec!["2", "1"]));
         let vals: ArrayRef = Arc::new(Int64Array::from(vec![2, 1]));
-        let mut agg = PriorityMap::new(DataType::Utf8, DataType::Int64, 1, false)?;
+        let mut agg = PriorityMap::new(
+            DataType::Utf8,
+            DataType::Int64,
+            1,
+            SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        )?;
         agg.set_batch(ids, vals);
         agg.insert(0)?;
         agg.insert(1)?;
@@ -305,7 +370,15 @@ mod tests {
     fn should_accept_higher_group() -> Result<()> {
         let ids: ArrayRef = Arc::new(StringArray::from(vec!["1", "2"]));
         let vals: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
-        let mut agg = PriorityMap::new(DataType::Utf8, DataType::Int64, 1, true)?;
+        let mut agg = PriorityMap::new(
+            DataType::Utf8,
+            DataType::Int64,
+            1,
+            SortOptions {
+                descending: true,
+                nulls_first: true,
+            },
+        )?;
         agg.set_batch(ids, vals);
         agg.insert(0)?;
         agg.insert(1)?;
@@ -329,7 +402,15 @@ mod tests {
     fn should_accept_lower_for_group() -> Result<()> {
         let ids: ArrayRef = Arc::new(StringArray::from(vec!["1", "1"]));
         let vals: ArrayRef = Arc::new(Int64Array::from(vec![2, 1]));
-        let mut agg = PriorityMap::new(DataType::Utf8, DataType::Int64, 2, false)?;
+        let mut agg = PriorityMap::new(
+            DataType::Utf8,
+            DataType::Int64,
+            2,
+            SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        )?;
         agg.set_batch(ids, vals);
         agg.insert(0)?;
         agg.insert(1)?;
@@ -353,7 +434,15 @@ mod tests {
     fn should_accept_higher_for_group() -> Result<()> {
         let ids: ArrayRef = Arc::new(StringArray::from(vec!["1", "1"]));
         let vals: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
-        let mut agg = PriorityMap::new(DataType::Utf8, DataType::Int64, 2, true)?;
+        let mut agg = PriorityMap::new(
+            DataType::Utf8,
+            DataType::Int64,
+            2,
+            SortOptions {
+                descending: true,
+                nulls_first: true,
+            },
+        )?;
         agg.set_batch(ids, vals);
         agg.insert(0)?;
         agg.insert(1)?;
@@ -377,7 +466,15 @@ mod tests {
     fn should_handle_null_ids() -> Result<()> {
         let ids: ArrayRef = Arc::new(StringArray::from(vec![Some("1"), None, None]));
         let vals: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
-        let mut agg = PriorityMap::new(DataType::Utf8, DataType::Int64, 2, true)?;
+        let mut agg = PriorityMap::new(
+            DataType::Utf8,
+            DataType::Int64,
+            2,
+            SortOptions {
+                descending: true,
+                nulls_first: true,
+            },
+        )?;
         agg.set_batch(ids, vals);
         agg.insert(0)?;
         agg.insert(1)?;

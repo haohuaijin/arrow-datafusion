@@ -258,3 +258,76 @@ physical_plan
 
 statement ok
 drop table traces;
+
+# TopK aggregation
+statement ok
+CREATE TABLE t_null_aggregate(a int, b int) AS VALUES (1, 2), (2, 4), (3, NULL), (4, 3);
+
+statement ok
+set datafusion.optimizer.enable_topk_aggregation = false;
+
+query II
+select a, max(b) from t_null_aggregate group by a order by max(b) desc limit 3;
+----
+3 NULL
+2 4
+4 3
+
+query II
+select a, max(b) from t_null_aggregate group by a order by max(b) desc nulls last limit 4;
+----
+2 4
+4 3
+1 2
+3 NULL
+
+query II
+select a, min(b) from t_null_aggregate group by a order by min(b) asc limit 4;
+----
+1 2
+4 3
+2 4
+3 NULL
+
+query II
+select a, min(b) from t_null_aggregate group by a order by min(b) asc nulls first limit 3;
+----
+3 NULL
+1 2
+4 3
+
+statement ok
+set datafusion.optimizer.enable_topk_aggregation = true;
+
+query II
+select a, max(b) from t_null_aggregate group by a order by max(b) desc limit 3;
+----
+3 NULL
+2 4
+4 3
+
+query II
+select a, max(b) from t_null_aggregate group by a order by max(b) desc nulls last limit 4;
+----
+2 4
+4 3
+1 2
+3 NULL
+
+query II
+select a, min(b) from t_null_aggregate group by a order by min(b) asc limit 4;
+----
+1 2
+4 3
+2 4
+3 NULL
+
+query II
+select a, min(b) from t_null_aggregate group by a order by min(b) asc nulls first limit 3;
+----
+3 NULL
+1 2
+4 3
+
+statement ok
+drop table t_null_aggregate;

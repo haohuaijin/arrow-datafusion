@@ -261,7 +261,11 @@ async fn agg_grouped_topk_yields(
             inf.clone(),
             inf.schema(),
         )?
-        .with_limit(Some(100)),
+        .with_limit(Some(100))
+        .with_sort_options(Some(SortOptions {
+            descending: true,
+            nulls_first: true,
+        })),
     );
 
     query_yields(aggr, session_ctx.task_ctx()).await

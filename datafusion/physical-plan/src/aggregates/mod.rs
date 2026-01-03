@@ -41,6 +41,7 @@ use parking_lot::Mutex;
 use std::collections::HashSet;
 
 use arrow::array::{ArrayRef, UInt8Array, UInt16Array, UInt32Array, UInt64Array};
+use arrow::compute::SortOptions;
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::FieldRef;
@@ -502,6 +503,8 @@ pub struct AggregateExec {
     filter_expr: Vec<Option<Arc<dyn PhysicalExpr>>>,
     /// Set if the output of this aggregation is truncated by a upstream sort/limit clause
     limit: Option<usize>,
+    /// Sort options for TopK aggregation (specifies NULL ordering)
+    sort_options: Option<SortOptions>,
     /// Input plan, could be a partial aggregate or the input to the aggregate
     pub input: Arc<dyn ExecutionPlan>,
     /// Schema after the aggregate is applied
@@ -546,6 +549,7 @@ impl AggregateExec {
             group_by: self.group_by.clone(),
             filter_expr: self.filter_expr.clone(),
             limit: self.limit,
+            sort_options: self.sort_options,
             input: Arc::clone(&self.input),
             schema: Arc::clone(&self.schema),
             input_schema: Arc::clone(&self.input_schema),
@@ -677,6 +681,7 @@ impl AggregateExec {
             metrics: ExecutionPlanMetricsSet::new(),
             required_input_ordering,
             limit: None,
+            sort_options: None,
             input_order_mode,
             cache,
             dynamic_filter: None,
@@ -697,6 +702,13 @@ impl AggregateExec {
         self.limit = limit;
         self
     }
+
+    /// Set the `sort_options` of this AggExec for TopK aggregation
+    pub fn with_sort_options(mut self, sort_options: Option<SortOptions>) -> Self {
+        self.sort_options = sort_options;
+        self
+    }
+
     /// Grouping expressions
     pub fn group_expr(&self) -> &PhysicalGroupBy {
         &self.group_by
@@ -1214,7 +1226,8 @@ impl ExecutionPlan for AggregateExec {
             Arc::clone(&self.input_schema),
             Arc::clone(&self.schema),
         )?;
-        me.limit = self.limit;
+        me = me.with_limit(self.limit);
+        me = me.with_sort_options(self.sort_options);
         me.dynamic_filter = self.dynamic_filter.clone();
 
         Ok(Arc::new(me))
