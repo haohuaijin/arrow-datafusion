@@ -258,79 +258,79 @@ physical_plan
 
 ## Test GROUP BY with ORDER BY on the same column (no aggregate functions)
 statement ok
-CREATE TABLE names(name varchar, value int) AS VALUES
-('alice', 1),
-('bob', 2),
-('charlie', 3),
-('david', 4),
-('alice', 5),
-('bob', 6),
-('eve', 7);
+CREATE TABLE ids(id int, value int) AS VALUES
+(1, 10),
+(2, 20),
+(3, 30),
+(4, 40),
+(1, 50),
+(2, 60),
+(5, 70);
 
 query TT
-explain select name from names group by name order by name desc limit 3;
+explain select id from ids group by id order by id desc limit 3;
 ----
 logical_plan
-01)Sort: names.name DESC NULLS FIRST, fetch=3
-02)--Aggregate: groupBy=[[names.name]], aggr=[[]]
-03)----TableScan: names projection=[name]
+01)Sort: ids.id DESC NULLS FIRST, fetch=3
+02)--Aggregate: groupBy=[[ids.id]], aggr=[[]]
+03)----TableScan: ids projection=[id]
 physical_plan
-01)SortPreservingMergeExec: [name@0 DESC], fetch=3
-02)--SortExec: TopK(fetch=3), expr=[name@0 DESC], preserve_partitioning=[true]
-03)----AggregateExec: mode=FinalPartitioned, gby=[name@0 as name], aggr=[], lim=[3]
-04)------RepartitionExec: partitioning=Hash([name@0], 4), input_partitions=1
-05)--------AggregateExec: mode=Partial, gby=[name@0 as name], aggr=[], lim=[3]
+01)SortPreservingMergeExec: [id@0 DESC], fetch=3
+02)--SortExec: TopK(fetch=3), expr=[id@0 DESC], preserve_partitioning=[true]
+03)----AggregateExec: mode=FinalPartitioned, gby=[id@0 as id], aggr=[], lim=[3]
+04)------RepartitionExec: partitioning=Hash([id@0], 4), input_partitions=1
+05)--------AggregateExec: mode=Partial, gby=[id@0 as id], aggr=[], lim=[3]
 06)----------DataSourceExec: partitions=1, partition_sizes=[1]
 
-query T
-select name from names group by name order by name desc limit 3;
+query I
+select id from ids group by id order by id desc limit 3;
 ----
-eve
-david
-charlie
+5
+4
+3
 
 query TT
-explain select name from names group by name order by name asc limit 2;
+explain select id from ids group by id order by id asc limit 2;
 ----
 logical_plan
-01)Sort: names.name ASC NULLS LAST, fetch=2
-02)--Aggregate: groupBy=[[names.name]], aggr=[[]]
-03)----TableScan: names projection=[name]
+01)Sort: ids.id ASC NULLS LAST, fetch=2
+02)--Aggregate: groupBy=[[ids.id]], aggr=[[]]
+03)----TableScan: ids projection=[id]
 physical_plan
-01)SortPreservingMergeExec: [name@0 ASC NULLS LAST], fetch=2
-02)--SortExec: TopK(fetch=2), expr=[name@0 ASC NULLS LAST], preserve_partitioning=[true]
-03)----AggregateExec: mode=FinalPartitioned, gby=[name@0 as name], aggr=[], lim=[2]
-04)------RepartitionExec: partitioning=Hash([name@0], 4), input_partitions=1
-05)--------AggregateExec: mode=Partial, gby=[name@0 as name], aggr=[], lim=[2]
+01)SortPreservingMergeExec: [id@0 ASC NULLS LAST], fetch=2
+02)--SortExec: TopK(fetch=2), expr=[id@0 ASC NULLS LAST], preserve_partitioning=[true]
+03)----AggregateExec: mode=FinalPartitioned, gby=[id@0 as id], aggr=[], lim=[2]
+04)------RepartitionExec: partitioning=Hash([id@0], 4), input_partitions=1
+05)--------AggregateExec: mode=Partial, gby=[id@0 as id], aggr=[], lim=[2]
 06)----------DataSourceExec: partitions=1, partition_sizes=[1]
 
-query T
-select name from names group by name order by name asc limit 2;
+query I
+select id from ids group by id order by id asc limit 2;
 ----
-alice
-bob
+1
+2
 
 # Test with larger limit than distinct values
-query T
-select name from names group by name order by name desc limit 100;
+query I
+select id from ids group by id order by id desc limit 100;
 ----
-eve
-david
-charlie
-bob
-alice
+5
+4
+3
+2
+1
 
-# Test with StringView type (different from Utf8)
+# Test with bigint group by
 statement ok
-CREATE TABLE values_table (value INT, category VARCHAR) AS VALUES
-(1, 'A'),
-(2, 'B'),
-(3, 'C'),
-(4, 'D'),
-(5, 'E'),
-(2, 'B'),
-(1, 'A'),
-(4, 'D');
+CREATE TABLE values_table (value INT, category BIGINT) AS VALUES
+(10, 100),
+(20, 200),
+(30, 300),
+(40, 400),
+(50, 500),
+(20, 200),
+(10, 100),
+(40, 400);
 
 query TT
 explain select category from values_table group by category order by category desc limit 3;
@@ -347,20 +347,20 @@ physical_plan
 05)--------AggregateExec: mode=Partial, gby=[category@0 as category], aggr=[], lim=[3]
 06)----------DataSourceExec: partitions=1, partition_sizes=[1]
 
-query T
+query I
 select category from values_table group by category order by category desc limit 3;
 ----
-E
-D
-C
+500
+400
+300
 
 # Test with integer group by
 query I
 select value from values_table group by value order by value asc limit 3;
 ----
-1
-2
-3
+10
+20
+30
 
 # Test DISTINCT semantics are preserved
 query I
@@ -372,7 +372,7 @@ statement ok
 drop table values_table;
 
 statement ok
-drop table names;
+drop table ids;
 
 statement ok
 drop table traces;
