@@ -69,7 +69,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use arrow::array::BooleanArray;
-use arrow::datatypes::{DataType, Schema, SchemaRef};
+use arrow::compute::cast;
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::{ArrowError, Result as ArrowResult};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ProjectionMask;
@@ -81,7 +82,7 @@ use datafusion_common::Result;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion_physical_expr::expressions::Column;
-use datafusion_physical_expr::utils::reassign_expr_columns;
+use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
 use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
 
 use datafusion_physical_plan::metrics;
@@ -114,6 +115,8 @@ pub(crate) struct DatafusionArrowPredicate {
     rows_matched: metrics::Count,
     /// how long was spent evaluating this predicate
     time: metrics::Time,
+    /// The Arrow schema containing only the columns required by this filter
+    filter_schema: SchemaRef,
 }
 
 impl DatafusionArrowPredicate {
@@ -140,6 +143,7 @@ impl DatafusionArrowPredicate {
             rows_pruned,
             rows_matched,
             time,
+            filter_schema: candidate.filter_schema,
         })
     }
 }
@@ -170,6 +174,61 @@ impl ArrowPredicate for DatafusionArrowPredicate {
                     "Error evaluating filter predicate: {e:?}"
                 ))
             })
+    }
+
+    fn evaluate_dictionary(
+        &mut self,
+        dictionary: arrow::array::ArrayRef,
+    ) -> Option<Result<BooleanArray, ArrowError>> {
+        let columns = collect_columns(&self.physical_expr);
+        if columns.len() != 1 {
+            return None;
+        }
+
+        let column = columns.into_iter().next().unwrap();
+        let expected_type = match self.filter_schema.field_with_name(column.name()) {
+            Ok(field) => field.data_type().clone(),
+            Err(_) => return None,
+        };
+
+        let dictionary = if dictionary.data_type() != &expected_type {
+            match cast(dictionary.as_ref(), &expected_type) {
+                Ok(array) => array,
+                Err(err) => return Some(Err(err)),
+            }
+        } else {
+            dictionary
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            column.name(),
+            expected_type,
+            true,
+        )]));
+
+        let batch = match RecordBatch::try_new(schema, vec![dictionary]) {
+            Ok(batch) => batch,
+            Err(err) => return Some(Err(err)),
+        };
+
+        // scoped timer updates on drop
+        let mut timer = self.time.timer();
+        let result = self
+            .physical_expr
+            .evaluate(&batch)
+            .and_then(|v| v.into_array(batch.num_rows()))
+            .and_then(|array| {
+                let bool_arr = as_boolean_array(&array)?.clone();
+                timer.stop();
+                Ok(bool_arr)
+            })
+            .map_err(|e| {
+                ArrowError::ComputeError(format!(
+                    "Error evaluating filter predicate on dictionary: {e:?}"
+                ))
+            });
+
+        Some(result)
     }
 }
 

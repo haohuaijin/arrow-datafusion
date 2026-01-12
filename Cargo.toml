@@ -91,19 +91,19 @@ ahash = { version = "0.8", default-features = false, features = [
     "runtime-rng",
 ] }
 apache-avro = { version = "0.21", default-features = false }
-arrow = { version = "57.1.0", features = [
+arrow = { path = "/Users/huaijinhao/gitrepo/project/arrow-rs/arrow", features = [
     "prettyprint",
     "chrono-tz",
 ] }
-arrow-buffer = { version = "57.1.0", default-features = false }
-arrow-flight = { version = "57.1.0", features = [
+arrow-buffer = { path = "/Users/huaijinhao/gitrepo/project/arrow-rs/arrow-buffer", default-features = false }
+arrow-flight = { path = "/Users/huaijinhao/gitrepo/project/arrow-rs/arrow-flight", features = [
     "flight-sql-experimental",
 ] }
-arrow-ipc = { version = "57.1.0", default-features = false, features = [
+arrow-ipc = { path = "/Users/huaijinhao/gitrepo/project/arrow-rs/arrow-ipc", default-features = false, features = [
     "lz4",
 ] }
-arrow-ord = { version = "57.1.0", default-features = false }
-arrow-schema = { version = "57.1.0", default-features = false }
+arrow-ord = { path = "/Users/huaijinhao/gitrepo/project/arrow-rs/arrow-ord", default-features = false }
+arrow-schema = { path = "/Users/huaijinhao/gitrepo/project/arrow-rs/arrow-schema", default-features = false }
 async-trait = "0.1.89"
 bigdecimal = "0.4.8"
 bytes = "1.11"
@@ -166,7 +166,7 @@ log = "^0.4"
 num-traits = { version = "0.2" }
 object_store = { version = "0.12.4", default-features = false }
 parking_lot = "0.12"
-parquet = { version = "57.1.0", default-features = false, features = [
+parquet = { path = "/Users/huaijinhao/gitrepo/project/arrow-rs/parquet", default-features = false, features = [
     "arrow",
     "async",
     "object_store",
