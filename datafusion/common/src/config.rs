@@ -922,6 +922,10 @@ config_namespace! {
         /// past window functions, if possible
         pub enable_window_limits: bool, default = true
 
+        /// When set to true, the optimizer will attempt to optimize per-partition TopK queries
+        /// by replacing Sort with PartitionedTopKSort for ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...) patterns
+        pub enable_window_topk_pushdown: bool, default = true
+
         /// When set to true, the optimizer will attempt to push down TopK dynamic filters
         /// into the file scan phase.
         pub enable_topk_dynamic_filter_pushdown: bool, default = true

@@ -21,7 +21,7 @@
 //!
 //! ## Usage
 //! ```bash
-//! cargo run --example query_planning -- [all|analyzer_rule|expr_api|optimizer_rule|parse_sql_expr|plan_to_sql|planner_api|pruning|thread_pools]
+//! cargo run --example query_planning -- [all|analyzer_rule|expr_api|optimizer_rule|parse_sql_expr|plan_to_sql|planner_api|pruning|thread_pools|window_topk_optimizer]
 //! ```
 //!
 //! Each subcommand runs a corresponding example:
@@ -59,6 +59,7 @@ mod plan_to_sql;
 mod planner_api;
 mod pruning;
 mod thread_pools;
+mod window_topk_optimizer;
 
 use datafusion::error::{DataFusionError, Result};
 use strum::{IntoEnumIterator, VariantNames};
@@ -76,6 +77,7 @@ enum ExampleKind {
     PlannerApi,
     Pruning,
     ThreadPools,
+    WindowTopkOptimizer,
 }
 
 impl ExampleKind {
@@ -101,6 +103,9 @@ impl ExampleKind {
             ExampleKind::PlannerApi => planner_api::planner_api().await?,
             ExampleKind::Pruning => pruning::pruning().await?,
             ExampleKind::ThreadPools => thread_pools::thread_pools().await?,
+            ExampleKind::WindowTopkOptimizer => {
+                window_topk_optimizer::window_topk_optimizer().await?
+            }
         }
         Ok(())
     }

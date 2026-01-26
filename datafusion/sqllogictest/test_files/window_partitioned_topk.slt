@@ -1,0 +1,130 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Test for per-partition TopK optimization with ROW_NUMBER window function
+# Related to issue: https://github.com/apache/datafusion/issues/6899
+
+statement ok
+CREATE TABLE sales (
+    category VARCHAR,
+    product VARCHAR,
+    revenue INT
+) AS VALUES
+    ('Electronics', 'Laptop', 1000),
+    ('Electronics', 'Phone', 800),
+    ('Electronics', 'Tablet', 600),
+    ('Electronics', 'Monitor', 400),
+    ('Electronics', 'Keyboard', 200),
+    ('Furniture', 'Desk', 500),
+    ('Furniture', 'Chair', 300),
+    ('Furniture', 'Lamp', 150),
+    ('Furniture', 'Shelf', 250),
+    ('Furniture', 'Cabinet', 400),
+    ('Clothing', 'Shirt', 50),
+    ('Clothing', 'Pants', 70),
+    ('Clothing', 'Shoes', 90),
+    ('Clothing', 'Hat', 30),
+    ('Clothing', 'Jacket', 120);
+
+# Test basic per-partition TopK with ROW_NUMBER
+# Output should be sorted by (category, revenue DESC)
+query TI
+SELECT category, revenue
+FROM (
+    SELECT
+        category,
+        revenue,
+        ROW_NUMBER() OVER (PARTITION BY category ORDER BY revenue DESC) as rn
+    FROM sales
+) t
+WHERE rn <= 2
+ORDER BY category, revenue DESC;
+----
+Clothing 120
+Clothing 90
+Electronics 1000
+Electronics 800
+Furniture 500
+Furniture 400
+
+# Test with row_number < 3 (should get top 2)
+query TI
+SELECT category, revenue
+FROM (
+    SELECT
+        category,
+        revenue,
+        ROW_NUMBER() OVER (PARTITION BY category ORDER BY revenue DESC) as rn
+    FROM sales
+) t
+WHERE rn < 3
+ORDER BY category, revenue DESC;
+----
+Clothing 120
+Clothing 90
+Electronics 1000
+Electronics 800
+Furniture 500
+Furniture 400
+
+# Test with ascending order
+query TI
+SELECT category, revenue
+FROM (
+    SELECT
+        category,
+        revenue,
+        ROW_NUMBER() OVER (PARTITION BY category ORDER BY revenue ASC) as rn
+    FROM sales
+) t
+WHERE rn <= 2
+ORDER BY category, revenue ASC;
+----
+Clothing 30
+Clothing 50
+Electronics 200
+Electronics 400
+Furniture 150
+Furniture 250
+
+# Verify the plan uses PartitionedTopKSortExec
+# Note: Check that PartitionedTopKSortExec appears in the physical plan
+query TT
+EXPLAIN SELECT category, revenue
+FROM (
+    SELECT
+        category,
+        revenue,
+        ROW_NUMBER() OVER (PARTITION BY category ORDER BY revenue DESC) as rn
+    FROM sales
+) t
+WHERE rn <= 2;
+----
+logical_plan
+01)SubqueryAlias: t
+02)--Projection: sales.category, sales.revenue
+03)----Filter: row_number() PARTITION BY [sales.category] ORDER BY [sales.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW <= UInt64(2)
+04)------WindowAggr: windowExpr=[[row_number() PARTITION BY [sales.category] ORDER BY [sales.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
+05)--------TableScan: sales projection=[category, revenue]
+physical_plan
+01)FilterExec: row_number() PARTITION BY [sales.category] ORDER BY [sales.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@2 <= 2, projection=[category@0, revenue@1]
+02)--BoundedWindowAggExec: wdw=[row_number() PARTITION BY [sales.category] ORDER BY [sales.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Field { "row_number() PARTITION BY [sales.category] ORDER BY [sales.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW": UInt64 }, frame: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
+03)----PartitionedTopKSortExec: partition_by=[[PhysicalSortExpr { expr: Column { name: "category", index: 0 }, options: SortOptions { descending: false, nulls_first: false } }]], order_by=[[PhysicalSortExpr { expr: Column { name: "revenue", index: 1 }, options: SortOptions { descending: true, nulls_first: true } }]], fetch=2
+04)------DataSourceExec: partitions=1, partition_sizes=[1]
+
+statement ok
+DROP TABLE sales;
