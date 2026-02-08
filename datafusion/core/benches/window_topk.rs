@@ -20,13 +20,13 @@
 use arrow::array::{Int64Builder, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion::physical_plan::{collect, displayable};
 use datafusion::prelude::SessionContext;
 use datafusion::{datasource::MemTable, error::Result};
 use datafusion_execution::config::SessionConfig;
-use rand::SeedableRng;
 use rand::Rng;
+use rand::SeedableRng;
 use std::hint::black_box;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
@@ -92,7 +92,8 @@ async fn create_context(
     num_categories: usize,
     use_window_topk: bool,
 ) -> Result<SessionContext> {
-    let (schema, parts) = make_window_data(num_partitions, rows_per_category, num_categories)?;
+    let (schema, parts) =
+        make_window_data(num_partitions, rows_per_category, num_categories)?;
     let mem_table = Arc::new(MemTable::try_new(schema, parts)?);
 
     let mut cfg = SessionConfig::new();

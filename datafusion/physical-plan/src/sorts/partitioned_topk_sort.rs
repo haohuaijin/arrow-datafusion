@@ -38,7 +38,7 @@ use crate::{
     DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
     PlanProperties, SendableRecordBatchStream, Statistics,
 };
-use arrow::array::{ArrayRef, RecordBatch};
+use arrow::array::{ArrayRef, RecordBatch, UInt32Array};
 use arrow::compute::{concat_batches, lexsort_to_indices, take};
 use arrow::datatypes::SchemaRef;
 use arrow::row::{RowConverter, SortField};
@@ -47,6 +47,76 @@ use datafusion_execution::TaskContext;
 use datafusion_physical_expr::LexOrdering;
 
 use futures::{StreamExt, TryStreamExt};
+
+/// Per-partition state for incremental TopK accumulation.
+///
+/// Accumulates batches for a single partition and supports compaction
+/// (sort + truncate to K rows) to bound memory usage.
+struct PartitionState {
+    /// Accumulated batches for this partition
+    batches: Vec<RecordBatch>,
+    /// Total number of rows across all batches
+    num_rows: usize,
+    /// Whether the current state is already sorted and truncated
+    is_sorted: bool,
+}
+
+impl PartitionState {
+    fn new() -> Self {
+        Self {
+            batches: Vec::new(),
+            num_rows: 0,
+            is_sorted: true,
+        }
+    }
+
+    fn add_batch(&mut self, batch: RecordBatch) {
+        self.num_rows += batch.num_rows();
+        self.batches.push(batch);
+        self.is_sorted = false;
+    }
+
+    /// Sort by ORDER BY expressions and keep only top `fetch` rows.
+    ///
+    /// Uses only the non-partition sort expressions for sorting since
+    /// partition columns are constant within a partition.
+    fn sort_and_truncate(
+        &mut self,
+        schema: &SchemaRef,
+        sort_exprs: &LexOrdering,
+        partition_prefix_len: usize,
+        fetch: usize,
+    ) -> Result<()> {
+        if self.is_sorted && self.num_rows <= fetch {
+            return Ok(());
+        }
+        if self.batches.is_empty() || self.num_rows == 0 {
+            return Ok(());
+        }
+
+        let combined = concat_batches(schema, &self.batches)?;
+        let n = fetch.min(combined.num_rows());
+        let order_exprs = &sort_exprs[partition_prefix_len..];
+
+        let result = if order_exprs.is_empty() {
+            // No ORDER BY within partition - take first n rows
+            combined.slice(0, n)
+        } else {
+            // Sort by ORDER BY columns only and take top n
+            let sort_columns: Vec<_> = order_exprs
+                .iter()
+                .map(|expr| expr.evaluate_to_sort_column(&combined))
+                .collect::<Result<Vec<_>>>()?;
+            let sorted_indices = lexsort_to_indices(&sort_columns, Some(n))?;
+            take_batch(&combined, &sorted_indices)?
+        };
+
+        self.num_rows = result.num_rows();
+        self.batches = vec![result];
+        self.is_sorted = true;
+        Ok(())
+    }
+}
 
 /// Partitioned TopK Sort execution plan.
 ///
@@ -261,138 +331,132 @@ impl ExecutionPlan for PartitionedTopKSortExec {
     }
 }
 
-/// Core algorithm for partitioned topk sort
+/// Core algorithm for partitioned topk sort.
 ///
-/// Groups input batches by partition prefix, sorts each group,
-/// and keeps only top K rows per partition.
+/// Processes input batches incrementally, grouping rows by partition key
+/// and maintaining per-partition TopK state with periodic compaction.
+/// This avoids collecting all data into memory before processing.
+///
+/// Key optimizations over a naive approach:
+/// - Incremental processing: batches are processed as they arrive
+/// - Per-partition compaction: memory bounded to O(K * num_partitions)
+/// - Sorts only by ORDER BY columns within partitions (partition columns are constant)
+/// - No redundant final sort: partitions emitted in sorted order
 async fn partitioned_topk_sort(
     mut input: SendableRecordBatchStream,
     schema: SchemaRef,
     sort_exprs: LexOrdering,
     partition_prefix_len: usize,
     fetch: usize,
-    _baseline_metrics: BaselineMetrics,
+    baseline_metrics: BaselineMetrics,
 ) -> Result<SendableRecordBatchStream> {
-    // Collect all input batches
-    let mut batches = Vec::new();
-    while let Some(batch) = input.next().await {
-        let batch = batch?;
-        if batch.num_rows() > 0 {
-            batches.push(batch);
-        }
-    }
+    let _timer = baseline_metrics.elapsed_compute().timer();
 
-    if batches.is_empty() {
-        return Ok(Box::pin(RecordBatchStreamAdapter::new(
-            Arc::clone(&schema),
-            futures::stream::iter(vec![]),
-        )));
-    }
-
-    // Concatenate all batches
-    let combined_batch = concat_batches(&schema, &batches)?;
-    if combined_batch.num_rows() == 0 {
-        return Ok(Box::pin(RecordBatchStreamAdapter::new(
-            Arc::clone(&schema),
-            futures::stream::iter(vec![]),
-        )));
-    }
-
-    // Extract partition columns (prefix of sort key)
     let partition_sort_exprs = &sort_exprs[..partition_prefix_len];
 
-    // Build a row converter for partition keys to enable grouping
+    // Build RowConverter with correct sort options so that bytewise comparison
+    // of partition keys matches the requested sort order
     let partition_fields: Vec<SortField> = partition_sort_exprs
         .iter()
-        .map(|e| SortField::new(e.expr.data_type(&schema).unwrap()))
-        .collect();
-    let partition_row_converter = RowConverter::new(partition_fields)?;
-
-    // Evaluate partition key columns
-    let partition_arrays: Vec<ArrayRef> = partition_sort_exprs
-        .iter()
         .map(|e| {
-            e.expr
-                .evaluate(&combined_batch)
-                .and_then(|v| v.into_array(combined_batch.num_rows()))
+            Ok(SortField::new_with_options(
+                e.expr.data_type(&schema)?,
+                e.options,
+            ))
         })
         .collect::<Result<Vec<_>>>()?;
+    let partition_row_converter = RowConverter::new(partition_fields)?;
 
-    // Convert partition keys to rows for grouping
-    let partition_rows = partition_row_converter.convert_columns(&partition_arrays)?;
+    // Per-partition state with compaction threshold
+    let mut partition_states: HashMap<Vec<u8>, PartitionState> = HashMap::new();
+    let compact_threshold = fetch.saturating_mul(2).max(fetch.saturating_add(128));
 
-    // Group row indices by partition
-    let mut partition_groups: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
-    for (idx, row) in partition_rows.iter().enumerate() {
-        partition_groups
-            .entry(row.as_ref().to_vec())
-            .or_default()
-            .push(idx);
-    }
+    // Process input batches incrementally
+    while let Some(batch) = input.next().await {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
 
-    // Sort partition keys to ensure deterministic output order
-    let mut partition_keys: Vec<Vec<u8>> = partition_groups.keys().cloned().collect();
-    partition_keys.sort();
-
-    // For each partition (in sorted order), sort and take top K
-    let mut result_indices = Vec::new();
-
-    for partition_key in partition_keys {
-        let indices = partition_groups.get(&partition_key).unwrap();
-        // Create a batch with only rows from this partition
-        let partition_batch = take_record_batch(&combined_batch, indices)?;
-
-        // Sort the partition batch
-        let sort_columns: Vec<_> = sort_exprs
+        // Evaluate partition key columns
+        let partition_arrays: Vec<ArrayRef> = partition_sort_exprs
             .iter()
-            .map(|expr| expr.evaluate_to_sort_column(&partition_batch))
+            .map(|e| {
+                e.expr
+                    .evaluate(&batch)
+                    .and_then(|v| v.into_array(batch.num_rows()))
+            })
             .collect::<Result<Vec<_>>>()?;
+        let partition_rows =
+            partition_row_converter.convert_columns(&partition_arrays)?;
 
-        let sorted_indices = lexsort_to_indices(
-            &sort_columns,
-            Some(fetch.min(partition_batch.num_rows())),
-        )?;
+        // Group row indices by partition key
+        let mut batch_groups: HashMap<Vec<u8>, Vec<u32>> = HashMap::new();
+        for (idx, row) in partition_rows.iter().enumerate() {
+            batch_groups
+                .entry(row.as_ref().to_vec())
+                .or_default()
+                .push(idx as u32);
+        }
 
-        // Map sorted indices back to original combined_batch indices
-        for &sorted_idx in sorted_indices.values().iter() {
-            result_indices.push(indices[sorted_idx as usize]);
+        // Distribute rows to per-partition states
+        for (partition_key, indices) in batch_groups {
+            let indices_array = UInt32Array::from(indices);
+            let partition_batch = take_batch(&batch, &indices_array)?;
+
+            let state = partition_states
+                .entry(partition_key)
+                .or_insert_with(PartitionState::new);
+            state.add_batch(partition_batch);
+
+            // Compact when accumulated rows exceed threshold to bound memory
+            if state.num_rows >= compact_threshold {
+                state.sort_and_truncate(
+                    &schema,
+                    &sort_exprs,
+                    partition_prefix_len,
+                    fetch,
+                )?;
+            }
         }
     }
 
-    // Take the selected rows from the combined batch
-    let result_batch = take_record_batch(&combined_batch, &result_indices)?;
+    // Sort partition keys for deterministic output order.
+    // RowConverter encodes sort options into the binary representation,
+    // so bytewise sort gives the correct logical order.
+    let mut partition_keys: Vec<Vec<u8>> = partition_states.keys().cloned().collect();
+    partition_keys.sort();
 
-    // Sort the final result by the full sort key to ensure output ordering
-    let sort_columns: Vec<_> = sort_exprs
-        .iter()
-        .map(|expr| expr.evaluate_to_sort_column(&result_batch))
-        .collect::<Result<Vec<_>>>()?;
+    // Final sort+truncate for each partition and collect results
+    let mut result_batches = Vec::with_capacity(partition_keys.len());
+    let mut total_output_rows = 0usize;
 
-    let final_sorted_indices = lexsort_to_indices(&sort_columns, None)?;
-    let final_result_batch = take_record_batch(
-        &result_batch,
-        &final_sorted_indices
-            .values()
-            .iter()
-            .map(|&i| i as usize)
-            .collect::<Vec<_>>(),
-    )?;
+    for key in &partition_keys {
+        if let Some(mut state) = partition_states.remove(key) {
+            state.sort_and_truncate(&schema, &sort_exprs, partition_prefix_len, fetch)?;
+            for batch in state.batches {
+                if batch.num_rows() > 0 {
+                    total_output_rows += batch.num_rows();
+                    result_batches.push(batch);
+                }
+            }
+        }
+    }
+
+    baseline_metrics.record_output(total_output_rows);
 
     Ok(Box::pin(RecordBatchStreamAdapter::new(
         Arc::clone(&schema),
-        futures::stream::iter(vec![Ok(final_result_batch)]),
+        futures::stream::iter(result_batches.into_iter().map(Ok)),
     )))
 }
 
-/// Helper function to take rows from a RecordBatch by indices
-fn take_record_batch(batch: &RecordBatch, indices: &[usize]) -> Result<RecordBatch> {
-    let indices_array =
-        arrow::array::UInt32Array::from_iter_values(indices.iter().map(|&i| i as u32));
-
+/// Take rows from a RecordBatch using a UInt32Array of indices
+fn take_batch(batch: &RecordBatch, indices: &UInt32Array) -> Result<RecordBatch> {
     let columns: Vec<ArrayRef> = batch
         .columns()
         .iter()
-        .map(|col| take(col.as_ref(), &indices_array, None))
+        .map(|col| take(col.as_ref(), indices, None))
         .collect::<std::result::Result<Vec<_>, arrow::error::ArrowError>>()
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
 
