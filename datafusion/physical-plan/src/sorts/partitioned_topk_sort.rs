@@ -491,12 +491,20 @@ impl DisplayAs for PartitionedTopKSortExec {
     ) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                let partition_exprs = &self.expr[..self.partition_prefix_len];
-                let order_exprs = &self.expr[self.partition_prefix_len..];
+                let partition_exprs: Vec<String> = self.expr[..self.partition_prefix_len]
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect();
+                let order_exprs: Vec<String> = self.expr[self.partition_prefix_len..]
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect();
                 write!(
                     f,
-                    "PartitionedTopKSortExec: partition_by=[{:?}], order_by=[{:?}], fetch={}",
-                    partition_exprs, order_exprs, self.fetch
+                    "PartitionedTopKSortExec: partition_by=[{}], order_by=[{}], fetch={}",
+                    partition_exprs.join(", "),
+                    order_exprs.join(", "),
+                    self.fetch
                 )
             }
             DisplayFormatType::TreeRender => Ok(()),

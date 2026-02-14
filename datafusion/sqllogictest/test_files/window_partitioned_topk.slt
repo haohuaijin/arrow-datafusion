@@ -123,7 +123,7 @@ logical_plan
 physical_plan
 01)FilterExec: row_number() PARTITION BY [sales.category] ORDER BY [sales.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@2 <= 2, projection=[category@0, revenue@1]
 02)--BoundedWindowAggExec: wdw=[row_number() PARTITION BY [sales.category] ORDER BY [sales.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Field { "row_number() PARTITION BY [sales.category] ORDER BY [sales.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW": UInt64 }, frame: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
-03)----PartitionedTopKSortExec: partition_by=[[PhysicalSortExpr { expr: Column { name: "category", index: 0 }, options: SortOptions { descending: false, nulls_first: false } }]], order_by=[[PhysicalSortExpr { expr: Column { name: "revenue", index: 1 }, options: SortOptions { descending: true, nulls_first: true } }]], fetch=2
+03)----PartitionedTopKSortExec: partition_by=[category@0 ASC NULLS LAST], order_by=[revenue@1 DESC], fetch=2
 04)------DataSourceExec: partitions=1, partition_sizes=[1]
 
 # Test with rn = 1 (single top row per partition)
