@@ -32,15 +32,15 @@ use std::sync::Arc;
 use tokio::runtime::Runtime;
 
 const LIMIT: usize = 10;
-const NUM_CATEGORIES: usize = 100;
+const PARTITIONS: usize = 10;
 
 /// Create test data for window TopK benchmarks
 /// Each category has `rows_per_category` rows with random revenue values
 fn make_window_data(
-    num_partitions: usize,
     rows_per_category: usize,
     num_categories: usize,
 ) -> Result<(SchemaRef, Vec<Vec<RecordBatch>>)> {
+    let num_partitions = PARTITIONS;
     let mut rng = rand::rngs::SmallRng::from_seed([42; 32]);
     let schema = Arc::new(Schema::new(vec![
         Field::new("category", DataType::Utf8, false),
@@ -87,13 +87,11 @@ fn make_window_data(
 }
 
 async fn create_context(
-    num_partitions: usize,
     rows_per_category: usize,
     num_categories: usize,
     use_window_topk: bool,
 ) -> Result<SessionContext> {
-    let (schema, parts) =
-        make_window_data(num_partitions, rows_per_category, num_categories)?;
+    let (schema, parts) = make_window_data(rows_per_category, num_categories)?;
     let mem_table = Arc::new(MemTable::try_new(schema, parts)?);
 
     let mut cfg = SessionConfig::new();
@@ -160,189 +158,57 @@ async fn window_topk_query(
     Ok(())
 }
 
-fn criterion_benchmark(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
-    let limit = LIMIT;
-
-    // Small dataset: 10 partitions, 10,000 rows per category, 100 categories = 1M rows
-    let partitions_small = 10;
-    let rows_per_category_small = 10_000;
-    let categories = NUM_CATEGORIES;
-
+/// Helper to benchmark a single scenario with and without optimization
+fn bench_case(
+    c: &mut Criterion,
+    rt: &Runtime,
+    label: &str,
+    num_categories: usize,
+    rows_per_category: usize,
+) {
     let ctx_no_opt = rt
-        .block_on(create_context(
-            partitions_small,
-            rows_per_category_small,
-            categories,
-            false,
-        ))
+        .block_on(create_context(rows_per_category, num_categories, false))
         .unwrap();
     c.bench_function(
         &format!(
-            "window topk {} rows [no optimization]",
-            partitions_small * rows_per_category_small * categories
+            "{label} ({num_categories} categories, {rows_per_category} rows per category) [no optimization]"
         ),
         |b| {
             b.iter(|| {
-                run_window_topk(&rt, ctx_no_opt.clone(), limit, false);
+                run_window_topk(rt, ctx_no_opt.clone(), LIMIT, false);
             })
         },
     );
 
     let ctx_with_opt = rt
-        .block_on(create_context(
-            partitions_small,
-            rows_per_category_small,
-            categories,
-            true,
-        ))
+        .block_on(create_context(rows_per_category, num_categories, true))
         .unwrap();
     c.bench_function(
         &format!(
-            "window topk {} rows [PartitionedTopKSortExec]",
-            partitions_small * rows_per_category_small * categories
+            "{label} ({num_categories} categories, {rows_per_category} rows per category) [PartitionedTopKSortExec]"
         ),
         |b| {
             b.iter(|| {
-                run_window_topk(&rt, ctx_with_opt.clone(), limit, true);
+                run_window_topk(rt, ctx_with_opt.clone(), LIMIT, true);
             })
         },
     );
+}
 
-    // Medium dataset: 10 partitions, 50,000 rows per category, 100 categories = 5M rows
-    let rows_per_category_medium = 50_000;
+fn criterion_benchmark(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
 
-    let ctx_no_opt_medium = rt
-        .block_on(create_context(
-            partitions_small,
-            rows_per_category_medium,
-            categories,
-            false,
-        ))
-        .unwrap();
-    c.bench_function(
-        &format!(
-            "window topk {} rows [no optimization]",
-            partitions_small * rows_per_category_medium * categories
-        ),
-        |b| {
-            b.iter(|| {
-                run_window_topk(&rt, ctx_no_opt_medium.clone(), limit, false);
-            })
-        },
-    );
+    // Case 1: Small number of categories, each with many rows
+    // 10 categories × 1,000,000 rows = 10M total rows
+    bench_case(c, &rt, "few categories, many rows", 10, 1_000_000);
 
-    let ctx_with_opt_medium = rt
-        .block_on(create_context(
-            partitions_small,
-            rows_per_category_medium,
-            categories,
-            true,
-        ))
-        .unwrap();
-    c.bench_function(
-        &format!(
-            "window topk {} rows [PartitionedTopKSortExec]",
-            partitions_small * rows_per_category_medium * categories
-        ),
-        |b| {
-            b.iter(|| {
-                run_window_topk(&rt, ctx_with_opt_medium.clone(), limit, true);
-            })
-        },
-    );
+    // Case 2: Large number of categories, each with only 10 rows
+    // 100,000 categories × 10 rows = 1M total rows
+    bench_case(c, &rt, "many categories, few rows", 100_000, 10);
 
-    // Test with fewer categories but more rows per category
-    let categories_few = 10;
-    let rows_per_category_many = 100_000;
-
-    let ctx_few_categories_no_opt = rt
-        .block_on(create_context(
-            partitions_small,
-            rows_per_category_many,
-            categories_few,
-            false,
-        ))
-        .unwrap();
-    c.bench_function(
-        &format!(
-            "window topk {} rows, {} categories [no optimization]",
-            partitions_small * rows_per_category_many * categories_few,
-            categories_few
-        ),
-        |b| {
-            b.iter(|| {
-                run_window_topk(&rt, ctx_few_categories_no_opt.clone(), limit, false);
-            })
-        },
-    );
-
-    let ctx_few_categories_with_opt = rt
-        .block_on(create_context(
-            partitions_small,
-            rows_per_category_many,
-            categories_few,
-            true,
-        ))
-        .unwrap();
-    c.bench_function(
-        &format!(
-            "window topk {} rows, {} categories [PartitionedTopKSortExec]",
-            partitions_small * rows_per_category_many * categories_few,
-            categories_few
-        ),
-        |b| {
-            b.iter(|| {
-                run_window_topk(&rt, ctx_few_categories_with_opt.clone(), limit, true);
-            })
-        },
-    );
-
-    // Test with many categories but fewer rows per category
-    let categories_many = 1000;
-    let rows_per_category_few = 1000;
-
-    let ctx_many_categories_no_opt = rt
-        .block_on(create_context(
-            partitions_small,
-            rows_per_category_few,
-            categories_many,
-            false,
-        ))
-        .unwrap();
-    c.bench_function(
-        &format!(
-            "window topk {} rows, {} categories [no optimization]",
-            partitions_small * rows_per_category_few * categories_many,
-            categories_many
-        ),
-        |b| {
-            b.iter(|| {
-                run_window_topk(&rt, ctx_many_categories_no_opt.clone(), limit, false);
-            })
-        },
-    );
-
-    let ctx_many_categories_with_opt = rt
-        .block_on(create_context(
-            partitions_small,
-            rows_per_category_few,
-            categories_many,
-            true,
-        ))
-        .unwrap();
-    c.bench_function(
-        &format!(
-            "window topk {} rows, {} categories [PartitionedTopKSortExec]",
-            partitions_small * rows_per_category_few * categories_many,
-            categories_many
-        ),
-        |b| {
-            b.iter(|| {
-                run_window_topk(&rt, ctx_many_categories_with_opt.clone(), limit, true);
-            })
-        },
-    );
+    // Case 3: Large number of categories, each with many rows
+    // 10,000 categories × 10,000 rows = 100M total rows
+    bench_case(c, &rt, "many categories, many rows", 10_000, 10_000);
 }
 
 criterion_group!(benches, criterion_benchmark);
