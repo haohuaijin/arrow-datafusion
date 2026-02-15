@@ -39,7 +39,6 @@
 //!   the processor from an input stream.
 
 use std::any::Any;
-use std::collections::HashMap;
 use std::mem::size_of;
 use std::sync::Arc;
 
@@ -48,6 +47,7 @@ use crate::aggregates::order::GroupOrdering;
 use crate::execution_plan::{Boundedness, CardinalityEffect, EmissionType};
 use crate::expressions::PhysicalSortExpr;
 use crate::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use crate::sorts::sort::ExternalSorter;
 use crate::stream::RecordBatchStreamAdapter;
 use crate::topk::TopKHeap;
 use crate::{
@@ -134,6 +134,12 @@ pub(crate) struct PartitionedTopK {
     partition_order_converter: RowConverter,
     /// Reusable buffer for group indices from GroupValues::intern
     current_group_indices: Vec<usize>,
+    /// Reusable per-group row index buffers, indexed by group_id.
+    /// Avoids HashMap allocation overhead that is significant when there
+    /// are many distinct partition values (e.g., 100k+).
+    scratch_group_rows: Vec<Vec<usize>>,
+    /// Reusable buffer tracking which groups were touched in the current batch
+    scratch_touched_groups: Vec<usize>,
 }
 
 impl PartitionedTopK {
@@ -194,6 +200,8 @@ impl PartitionedTopK {
             partition_heaps: Vec::new(),
             partition_order_converter,
             current_group_indices: Vec::new(),
+            scratch_group_rows: Vec::new(),
+            scratch_touched_groups: Vec::new(),
         })
     }
 
@@ -243,14 +251,24 @@ impl PartitionedTopK {
         rows.clear();
         self.order_row_converter.append(rows, &order_arrays)?;
 
-        // Group row indices by group_id
-        let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
+        // Group row indices by group_id using reusable Vec-based buffers.
+        // This avoids HashMap allocation overhead that is significant when
+        // there are many distinct partition values (e.g., 100k+).
+        while self.scratch_group_rows.len() < self.group_values.len() {
+            self.scratch_group_rows.push(Vec::new());
+        }
+        self.scratch_touched_groups.clear();
+
         for (row_idx, &group_id) in self.current_group_indices.iter().enumerate() {
-            groups.entry(group_id).or_default().push(row_idx);
+            if self.scratch_group_rows[group_id].is_empty() {
+                self.scratch_touched_groups.push(group_id);
+            }
+            self.scratch_group_rows[group_id].push(row_idx);
         }
 
-        // For each partition, register batch and add qualifying rows to heap
-        for (group_id, row_indices) in groups {
+        // For each touched partition, register batch and add qualifying rows
+        for &group_id in &self.scratch_touched_groups {
+            let row_indices = std::mem::take(&mut self.scratch_group_rows[group_id]);
             let heap = &mut self.partition_heaps[group_id];
             // RecordBatch::clone is cheap (Arc refs on column arrays)
             let mut batch_entry = heap.register_batch(batch.clone());
@@ -269,6 +287,10 @@ impl PartitionedTopK {
 
             heap.insert_batch_entry(batch_entry);
             heap.maybe_compact()?;
+
+            // Return the Vec for reuse (preserves capacity)
+            self.scratch_group_rows[group_id] = row_indices;
+            self.scratch_group_rows[group_id].clear();
         }
 
         // Update memory reservation
@@ -357,6 +379,11 @@ impl PartitionedTopK {
         )))
     }
 
+    /// Returns the total number of rows currently stored across all partition heaps.
+    fn total_heap_rows(&self) -> usize {
+        self.partition_heaps.iter().map(|h| h.len()).sum()
+    }
+
     /// Return the estimated memory used by this operator, in bytes.
     fn size(&self) -> usize {
         size_of::<Self>()
@@ -365,6 +392,12 @@ impl PartitionedTopK {
             + self.scratch_rows.size()
             + self.partition_order_converter.size()
             + self.partition_heaps.iter().map(|h| h.size()).sum::<usize>()
+            + self
+                .scratch_group_rows
+                .iter()
+                .map(|v| v.capacity() * size_of::<usize>())
+                .sum::<usize>()
+            + self.scratch_touched_groups.capacity() * size_of::<usize>()
     }
 }
 
@@ -558,25 +591,94 @@ impl ExecutionPlan for PartitionedTopKSortExec {
 
         let mut input = self.input.execute(partition, Arc::clone(&context))?;
 
-        let mut partitioned_topk = PartitionedTopK::try_new(
-            partition,
-            &input.schema(),
-            self.expr.clone(),
-            self.partition_prefix_len,
-            self.fetch,
-            context.session_config().batch_size(),
-            &context.runtime_env(),
-            &self.metrics,
-        )?;
+        let schema = input.schema();
+        let expr = self.expr.clone();
+        let partition_prefix_len = self.partition_prefix_len;
+        let fetch = self.fetch;
+        let batch_size = context.session_config().batch_size();
+        let runtime = context.runtime_env();
+        let metrics = self.metrics.clone();
+        let output_schema = self.schema();
+        let context = Arc::clone(&context);
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            self.schema(),
+            output_schema,
             futures::stream::once(async move {
-                while let Some(batch) = input.next().await {
-                    let batch = batch?;
-                    partitioned_topk.insert_batch(&batch)?;
+                // Read the first batch to probe filtering effectiveness
+                let Some(first_result) = input.next().await else {
+                    return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                        schema,
+                        futures::stream::iter(vec![]),
+                    )) as SendableRecordBatchStream);
+                };
+                let first_batch = first_result?;
+                let first_batch_rows = first_batch.num_rows();
+
+                let mut partitioned_topk = PartitionedTopK::try_new(
+                    partition,
+                    &schema,
+                    expr.clone(),
+                    partition_prefix_len,
+                    fetch,
+                    batch_size,
+                    &runtime,
+                    &metrics,
+                )?;
+
+                partitioned_topk.insert_batch(&first_batch)?;
+                let rows_in_heaps = partitioned_topk.total_heap_rows();
+
+                // Adaptive check: if heaps accepted >= 90% of input rows,
+                // the TopK filtering is ineffective (K ≈ rows_per_partition).
+                // Fall back to plain sort which has lower constant overhead.
+                //
+                // Only trigger when the first batch is at least `batch_size`
+                // rows, so we have enough data for a reliable decision.
+                // The sort fallback does NOT truncate per-partition (that is
+                // handled by the downstream BoundedWindowAggExec + Filter),
+                // so it must only be used when the full plan is present.
+                let filtering_ineffective = first_batch_rows >= batch_size
+                    && rows_in_heaps * 10 >= first_batch_rows * 9;
+
+                if filtering_ineffective {
+                    trace!(
+                        "PartitionedTopKSortExec: filtering ineffective \
+                         ({rows_in_heaps}/{first_batch_rows} rows accepted), \
+                         falling back to sort"
+                    );
+                    // Fall back to plain sort using ExternalSorter (same as
+                    // SortExec). This gives us memory tracking, spill-to-disk
+                    // support, and adaptive sort strategies. The downstream
+                    // BoundedWindowAggExec + FilterExec will handle the
+                    // per-partition truncation.
+                    drop(partitioned_topk);
+
+                    let execution_options = &context.session_config().options().execution;
+                    let mut sorter = ExternalSorter::new(
+                        partition,
+                        Arc::clone(&schema),
+                        expr,
+                        batch_size,
+                        execution_options.sort_spill_reservation_bytes,
+                        execution_options.sort_in_place_threshold_bytes,
+                        context.session_config().spill_compression(),
+                        &metrics,
+                        Arc::clone(&runtime),
+                    )?;
+
+                    sorter.insert_batch(first_batch).await?;
+                    while let Some(batch) = input.next().await {
+                        sorter.insert_batch(batch?).await?;
+                    }
+                    sorter.sort().await
+                } else {
+                    // TopK is effective, continue with heap approach
+                    while let Some(batch) = input.next().await {
+                        let batch = batch?;
+                        partitioned_topk.insert_batch(&batch)?;
+                    }
+                    partitioned_topk.emit()
                 }
-                partitioned_topk.emit()
             })
             .try_flatten(),
         )))

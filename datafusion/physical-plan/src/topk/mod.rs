@@ -685,6 +685,11 @@ impl TopKHeap {
         }
     }
 
+    /// Returns the number of rows currently stored in the heap
+    pub(crate) fn len(&self) -> usize {
+        self.inner.len()
+    }
+
     /// Register a [`RecordBatch`] with the heap, returning the
     /// appropriate entry
     pub fn register_batch(&mut self, batch: RecordBatch) -> RecordBatchEntry {

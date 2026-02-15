@@ -66,7 +66,7 @@ fn make_window_data(
 
             product_id_builder.append_value(global_row as i64);
             // Generate revenue values that create interesting TopK scenarios
-            let revenue = rng.random_range(1000..1000000);
+            let revenue = rng.random_range(1000..10000000);
             revenue_builder.append_value(revenue);
 
             global_row += 1;
@@ -206,9 +206,13 @@ fn criterion_benchmark(c: &mut Criterion) {
     // 100,000 categories × 10 rows = 1M total rows
     bench_case(c, &rt, "many categories, few rows", 100_000, 10);
 
-    // Case 3: Large number of categories, each with many rows
-    // 10,000 categories × 10,000 rows = 100M total rows
-    bench_case(c, &rt, "many categories, many rows", 10_000, 10_000);
+    // Case 3: Large number of categories with varying rows per category
+    // 10,000 categories × {1000, 100, 50, 20} rows = {10M, 1M, 500K, 200K} total rows
+    // Tests how the optimization scales as rows-per-category decreases
+    bench_case(c, &rt, "many categories, many rows", 10_000, 1_000);
+    bench_case(c, &rt, "many categories, many rows", 10_000, 100);
+    bench_case(c, &rt, "many categories, many rows", 10_000, 50);
+    bench_case(c, &rt, "many categories, many rows", 10_000, 20);
 }
 
 criterion_group!(benches, criterion_benchmark);
