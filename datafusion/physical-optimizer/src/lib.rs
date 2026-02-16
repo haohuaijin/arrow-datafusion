@@ -44,5 +44,6 @@ pub mod sanity_checker;
 pub mod topk_aggregation;
 pub mod update_aggr_exprs;
 pub mod utils;
+pub mod window_topk_pushdown;
 
 pub use optimizer::PhysicalOptimizerRule;

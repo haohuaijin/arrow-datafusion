@@ -37,6 +37,7 @@ use crate::update_aggr_exprs::OptimizeAggregateOrder;
 
 use crate::limit_pushdown_past_window::LimitPushPastWindows;
 use crate::pushdown_sort::PushdownSort;
+use crate::window_topk_pushdown::WindowTopKPushdown;
 use datafusion_common::Result;
 use datafusion_common::config::ConfigOptions;
 use datafusion_physical_plan::ExecutionPlan;
@@ -127,6 +128,10 @@ impl PhysicalOptimizer {
             // into an `order by max(x) limit y`. In this case it will copy the limit value down
             // to the aggregation, allowing it to use only y number of accumulators.
             Arc::new(TopKAggregation::new()),
+            // The WindowTopKPushdown rule optimizes per-partition TopK queries by replacing
+            // Sort with PartitionedTopKSort for ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...) < N patterns
+            // It needs to come after EnforceSorting (so sorts are in place) and before LimitPushPastWindows
+            Arc::new(WindowTopKPushdown::new()),
             // Tries to push limits down through window functions, growing as appropriate
             // This can possibly be combined with [LimitPushdown]
             // It needs to come after [EnforceSorting]

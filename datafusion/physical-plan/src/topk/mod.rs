@@ -659,7 +659,7 @@ impl TopKMetrics {
 ///
 /// Using the `Row` format handles things such as ascending vs
 /// descending and nulls first vs nulls last.
-struct TopKHeap {
+pub(crate) struct TopKHeap {
     /// The maximum number of elements to store in this heap.
     k: usize,
     /// The target number of rows for output batches
@@ -674,7 +674,7 @@ struct TopKHeap {
 }
 
 impl TopKHeap {
-    fn new(k: usize, batch_size: usize) -> Self {
+    pub(crate) fn new(k: usize, batch_size: usize) -> Self {
         assert!(k > 0);
         Self {
             k,
@@ -683,6 +683,11 @@ impl TopKHeap {
             store: RecordBatchStore::new(),
             owned_bytes: 0,
         }
+    }
+
+    /// Returns the number of rows currently stored in the heap
+    pub(crate) fn len(&self) -> usize {
+        self.inner.len()
     }
 
     /// Register a [`RecordBatch`] with the heap, returning the
@@ -700,7 +705,7 @@ impl TopKHeap {
     /// Returns the largest value stored by the heap if there are k
     /// items, otherwise returns None. Remember this structure is
     /// keeping the "smallest" k values
-    fn max(&self) -> Option<&TopKRow> {
+    pub(crate) fn max(&self) -> Option<&TopKRow> {
         if self.inner.len() < self.k {
             None
         } else {
@@ -711,7 +716,7 @@ impl TopKHeap {
     /// Adds `row` to this heap. If inserting this new item would
     /// increase the size past `k`, removes the previously smallest
     /// item.
-    fn add(
+    pub(crate) fn add(
         &mut self,
         batch_entry: &mut RecordBatchEntry,
         row: impl AsRef<[u8]>,
@@ -835,7 +840,7 @@ impl TopKHeap {
     }
 
     /// return the size of memory used by this heap, in bytes
-    fn size(&self) -> usize {
+    pub(crate) fn size(&self) -> usize {
         size_of::<Self>()
             + (self.inner.capacity() * size_of::<TopKRow>())
             + self.store.size()
@@ -890,7 +895,7 @@ impl TopKHeap {
 ///
 /// Reuses allocations to minimize runtime overhead of creating new Vecs
 #[derive(Debug, PartialEq)]
-struct TopKRow {
+pub(crate) struct TopKRow {
     /// the value of the sort key for this row. This contains the
     /// bytes that could be stored in `OwnedRow` but uses `Vec<u8>` to
     /// reuse allocations.
@@ -940,7 +945,7 @@ impl TopKRow {
     }
 
     /// Returns a slice to the owned row value
-    fn row(&self) -> &[u8] {
+    pub(crate) fn row(&self) -> &[u8] {
         self.row.as_slice()
     }
 }
@@ -961,11 +966,11 @@ impl Ord for TopKRow {
 }
 
 #[derive(Debug)]
-struct RecordBatchEntry {
-    id: u32,
-    batch: RecordBatch,
+pub(crate) struct RecordBatchEntry {
+    pub(crate) id: u32,
+    pub(crate) batch: RecordBatch,
     // for this batch, how many times has it been used
-    uses: usize,
+    pub(crate) uses: usize,
 }
 
 /// This structure tracks [`RecordBatch`] by an id so that:

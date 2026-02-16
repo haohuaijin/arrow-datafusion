@@ -1,0 +1,658 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Test for per-partition TopK optimization with ROW_NUMBER window function
+# Related to issue: https://github.com/apache/datafusion/issues/6899
+
+statement ok
+CREATE TABLE sales (
+    category VARCHAR,
+    product VARCHAR,
+    revenue INT
+) AS VALUES
+    ('Electronics', 'Laptop', 1000),
+    ('Electronics', 'Phone', 800),
+    ('Electronics', 'Tablet', 600),
+    ('Electronics', 'Monitor', 400),
+    ('Electronics', 'Keyboard', 200),
+    ('Furniture', 'Desk', 500),
+    ('Furniture', 'Chair', 300),
+    ('Furniture', 'Lamp', 150),
+    ('Furniture', 'Shelf', 250),
+    ('Furniture', 'Cabinet', 400),
+    ('Clothing', 'Shirt', 50),
+    ('Clothing', 'Pants', 70),
+    ('Clothing', 'Shoes', 90),
+    ('Clothing', 'Hat', 30),
+    ('Clothing', 'Jacket', 120);
+
+# Test basic per-partition TopK with ROW_NUMBER
+# Output should be sorted by (category, revenue DESC)
+query TI
+SELECT category, revenue
+FROM (
+    SELECT
+        category,
+        revenue,
+        ROW_NUMBER() OVER (PARTITION BY category ORDER BY revenue DESC) as rn
+    FROM sales
+) t
+WHERE rn <= 2
+ORDER BY category, revenue DESC;
+----
+Clothing 120
+Clothing 90
+Electronics 1000
+Electronics 800
+Furniture 500
+Furniture 400
+
+# Test with row_number < 3 (should get top 2)
+query TI
+SELECT category, revenue
+FROM (
+    SELECT
+        category,
+        revenue,
+        ROW_NUMBER() OVER (PARTITION BY category ORDER BY revenue DESC) as rn
+    FROM sales
+) t
+WHERE rn < 3
+ORDER BY category, revenue DESC;
+----
+Clothing 120
+Clothing 90
+Electronics 1000
+Electronics 800
+Furniture 500
+Furniture 400
+
+# Test with ascending order
+query TI
+SELECT category, revenue
+FROM (
+    SELECT
+        category,
+        revenue,
+        ROW_NUMBER() OVER (PARTITION BY category ORDER BY revenue ASC) as rn
+    FROM sales
+) t
+WHERE rn <= 2
+ORDER BY category, revenue ASC;
+----
+Clothing 30
+Clothing 50
+Electronics 200
+Electronics 400
+Furniture 150
+Furniture 250
+
+# Verify the plan uses PartitionedTopKSortExec
+# Note: Check that PartitionedTopKSortExec appears in the physical plan
+query TT
+EXPLAIN SELECT category, revenue
+FROM (
+    SELECT
+        category,
+        revenue,
+        ROW_NUMBER() OVER (PARTITION BY category ORDER BY revenue DESC) as rn
+    FROM sales
+) t
+WHERE rn <= 2;
+----
+logical_plan
+01)SubqueryAlias: t
+02)--Projection: sales.category, sales.revenue
+03)----Filter: row_number() PARTITION BY [sales.category] ORDER BY [sales.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW <= UInt64(2)
+04)------WindowAggr: windowExpr=[[row_number() PARTITION BY [sales.category] ORDER BY [sales.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
+05)--------TableScan: sales projection=[category, revenue]
+physical_plan
+01)FilterExec: row_number() PARTITION BY [sales.category] ORDER BY [sales.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@2 <= 2, projection=[category@0, revenue@1]
+02)--BoundedWindowAggExec: wdw=[row_number() PARTITION BY [sales.category] ORDER BY [sales.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Field { "row_number() PARTITION BY [sales.category] ORDER BY [sales.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW": UInt64 }, frame: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
+03)----PartitionedTopKSortExec: partition_by=[category@0 ASC NULLS LAST], order_by=[revenue@1 DESC], fetch=2
+04)------DataSourceExec: partitions=1, partition_sizes=[1]
+
+# Test with rn = 1 (single top row per partition)
+query TTI
+SELECT category, product, revenue
+FROM (
+    SELECT
+        category,
+        product,
+        revenue,
+        ROW_NUMBER() OVER (PARTITION BY category ORDER BY revenue DESC) as rn
+    FROM sales
+) t
+WHERE rn <= 1
+ORDER BY category;
+----
+Clothing Jacket 120
+Electronics Laptop 1000
+Furniture Desk 500
+
+# Test with large K (larger than partition size - should return all rows)
+query TI
+SELECT category, revenue
+FROM (
+    SELECT
+        category,
+        revenue,
+        ROW_NUMBER() OVER (PARTITION BY category ORDER BY revenue DESC) as rn
+    FROM sales
+) t
+WHERE rn <= 100
+ORDER BY category, revenue DESC;
+----
+Clothing 120
+Clothing 90
+Clothing 70
+Clothing 50
+Clothing 30
+Electronics 1000
+Electronics 800
+Electronics 600
+Electronics 400
+Electronics 200
+Furniture 500
+Furniture 400
+Furniture 300
+Furniture 250
+Furniture 150
+
+# Test preserving all columns through the optimization
+query TTII
+SELECT category, product, rn, revenue
+FROM (
+    SELECT
+        category,
+        product,
+        revenue,
+        ROW_NUMBER() OVER (PARTITION BY category ORDER BY revenue DESC) as rn
+    FROM sales
+) t
+WHERE rn <= 1
+ORDER BY category;
+----
+Clothing Jacket 1 120
+Electronics Laptop 1 1000
+Furniture Desk 1 500
+
+statement ok
+DROP TABLE sales;
+
+# =====================================================
+# Test with NULL values
+# =====================================================
+
+statement ok
+CREATE TABLE sales_with_nulls (
+    category VARCHAR,
+    product VARCHAR,
+    revenue INT
+) AS VALUES
+    ('Electronics', 'Laptop', 1000),
+    ('Electronics', 'Phone', NULL),
+    ('Electronics', 'Tablet', 600),
+    (NULL, 'Unknown1', 100),
+    (NULL, 'Unknown2', 200),
+    ('Furniture', 'Desk', 500),
+    ('Furniture', NULL, 300),
+    ('Furniture', 'Lamp', NULL);
+
+# Test with NULL values in partition column
+query TI
+SELECT category, revenue
+FROM (
+    SELECT
+        category,
+        revenue,
+        ROW_NUMBER() OVER (PARTITION BY category ORDER BY revenue DESC NULLS LAST) as rn
+    FROM sales_with_nulls
+) t
+WHERE rn <= 1
+ORDER BY category NULLS LAST;
+----
+Electronics 1000
+Furniture 500
+NULL 200
+
+# Test with NULL values in order column
+query TI
+SELECT category, revenue
+FROM (
+    SELECT
+        category,
+        revenue,
+        ROW_NUMBER() OVER (PARTITION BY category ORDER BY revenue DESC NULLS LAST) as rn
+    FROM sales_with_nulls
+) t
+WHERE rn <= 2
+ORDER BY category NULLS LAST, revenue DESC NULLS LAST;
+----
+Electronics 1000
+Electronics 600
+Furniture 500
+Furniture 300
+NULL 200
+NULL 100
+
+statement ok
+DROP TABLE sales_with_nulls;
+
+# =====================================================
+# Test with multiple partition columns
+# =====================================================
+
+statement ok
+CREATE TABLE multi_partition (
+    region VARCHAR,
+    category VARCHAR,
+    product VARCHAR,
+    revenue INT
+) AS VALUES
+    ('East', 'Electronics', 'Laptop', 1000),
+    ('East', 'Electronics', 'Phone', 800),
+    ('East', 'Electronics', 'Tablet', 600),
+    ('East', 'Clothing', 'Shirt', 50),
+    ('East', 'Clothing', 'Pants', 70),
+    ('West', 'Electronics', 'Monitor', 400),
+    ('West', 'Electronics', 'Keyboard', 200),
+    ('West', 'Clothing', 'Shoes', 90),
+    ('West', 'Clothing', 'Jacket', 120);
+
+# Partition by two columns: region and category
+query TTI
+SELECT region, category, revenue
+FROM (
+    SELECT
+        region,
+        category,
+        revenue,
+        ROW_NUMBER() OVER (PARTITION BY region, category ORDER BY revenue DESC) as rn
+    FROM multi_partition
+) t
+WHERE rn <= 1
+ORDER BY region, category;
+----
+East Clothing 70
+East Electronics 1000
+West Clothing 120
+West Electronics 400
+
+# Partition by two columns, keep top 2
+query TTTI
+SELECT region, category, product, revenue
+FROM (
+    SELECT
+        region,
+        category,
+        product,
+        revenue,
+        ROW_NUMBER() OVER (PARTITION BY region, category ORDER BY revenue DESC) as rn
+    FROM multi_partition
+) t
+WHERE rn <= 2
+ORDER BY region, category, revenue DESC;
+----
+East Clothing Pants 70
+East Clothing Shirt 50
+East Electronics Laptop 1000
+East Electronics Phone 800
+West Clothing Jacket 120
+West Clothing Shoes 90
+West Electronics Monitor 400
+West Electronics Keyboard 200
+
+statement ok
+DROP TABLE multi_partition;
+
+# =====================================================
+# Test with optimization disabled
+# =====================================================
+
+statement ok
+CREATE TABLE sales_opt_test (
+    category VARCHAR,
+    revenue INT
+) AS VALUES
+    ('A', 30),
+    ('A', 10),
+    ('A', 20),
+    ('B', 60),
+    ('B', 40),
+    ('B', 50);
+
+# Verify results are the same when optimization is disabled
+statement ok
+SET datafusion.optimizer.enable_window_topk_pushdown = false;
+
+query TI
+SELECT category, revenue
+FROM (
+    SELECT
+        category,
+        revenue,
+        ROW_NUMBER() OVER (PARTITION BY category ORDER BY revenue DESC) as rn
+    FROM sales_opt_test
+) t
+WHERE rn <= 2
+ORDER BY category, revenue DESC;
+----
+A 30
+A 20
+B 60
+B 50
+
+# Verify plan does NOT use PartitionedTopKSortExec when disabled
+query TT
+EXPLAIN SELECT category, revenue
+FROM (
+    SELECT
+        category,
+        revenue,
+        ROW_NUMBER() OVER (PARTITION BY category ORDER BY revenue DESC) as rn
+    FROM sales_opt_test
+) t
+WHERE rn <= 2;
+----
+logical_plan
+01)SubqueryAlias: t
+02)--Projection: sales_opt_test.category, sales_opt_test.revenue
+03)----Filter: row_number() PARTITION BY [sales_opt_test.category] ORDER BY [sales_opt_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW <= UInt64(2)
+04)------WindowAggr: windowExpr=[[row_number() PARTITION BY [sales_opt_test.category] ORDER BY [sales_opt_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
+05)--------TableScan: sales_opt_test projection=[category, revenue]
+physical_plan
+01)FilterExec: row_number() PARTITION BY [sales_opt_test.category] ORDER BY [sales_opt_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@2 <= 2, projection=[category@0, revenue@1]
+02)--BoundedWindowAggExec: wdw=[row_number() PARTITION BY [sales_opt_test.category] ORDER BY [sales_opt_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Field { "row_number() PARTITION BY [sales_opt_test.category] ORDER BY [sales_opt_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW": UInt64 }, frame: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
+03)----SortExec: expr=[category@0 ASC NULLS LAST, revenue@1 DESC], preserve_partitioning=[false]
+04)------DataSourceExec: partitions=1, partition_sizes=[1]
+
+# Re-enable
+statement ok
+SET datafusion.optimizer.enable_window_topk_pushdown = true;
+
+statement ok
+DROP TABLE sales_opt_test;
+
+# =====================================================
+# Test with multiple order by columns
+# =====================================================
+
+statement ok
+CREATE TABLE multi_order (
+    department VARCHAR,
+    name VARCHAR,
+    salary INT,
+    hire_date INT
+) AS VALUES
+    ('Engineering', 'Alice', 100, 2020),
+    ('Engineering', 'Bob', 100, 2019),
+    ('Engineering', 'Charlie', 90, 2021),
+    ('Engineering', 'David', 90, 2018),
+    ('Sales', 'Eve', 80, 2020),
+    ('Sales', 'Frank', 80, 2019),
+    ('Sales', 'Grace', 70, 2021);
+
+# Order by salary DESC, then hire_date ASC (tie-break)
+query TTII
+SELECT department, name, salary, hire_date
+FROM (
+    SELECT
+        department,
+        name,
+        salary,
+        hire_date,
+        ROW_NUMBER() OVER (PARTITION BY department ORDER BY salary DESC, hire_date ASC) as rn
+    FROM multi_order
+) t
+WHERE rn <= 2
+ORDER BY department, salary DESC, hire_date ASC;
+----
+Engineering Bob 100 2019
+Engineering Alice 100 2020
+Sales Frank 80 2019
+Sales Eve 80 2020
+
+statement ok
+DROP TABLE multi_order;
+
+# =====================================================
+# Test with different data types
+# =====================================================
+
+statement ok
+CREATE TABLE typed_data (
+    group_id BIGINT,
+    score DOUBLE,
+    label VARCHAR
+) AS VALUES
+    (1, 9.5, 'high'),
+    (1, 3.2, 'low'),
+    (1, 7.8, 'med'),
+    (2, 5.5, 'med'),
+    (2, 1.1, 'low'),
+    (2, 8.8, 'high');
+
+query IR
+SELECT group_id, score
+FROM (
+    SELECT
+        group_id,
+        score,
+        ROW_NUMBER() OVER (PARTITION BY group_id ORDER BY score DESC) as rn
+    FROM typed_data
+) t
+WHERE rn <= 2
+ORDER BY group_id, score DESC;
+----
+1 9.5
+1 7.8
+2 8.8
+2 5.5
+
+statement ok
+DROP TABLE typed_data;
+
+statement ok
+CREATE TABLE and_pred_test (
+    category VARCHAR,
+    revenue INT
+) AS VALUES
+    ('A', 100), ('A', 200), ('A', 300),
+    ('B', 400), ('B', 500), ('B', 600);
+
+# ROW_NUMBER limit combined with another filter condition via AND
+query TI
+SELECT category, revenue
+FROM (
+    SELECT
+        category,
+        revenue,
+        ROW_NUMBER() OVER (PARTITION BY category ORDER BY revenue DESC) as rn
+    FROM and_pred_test
+) t
+WHERE rn <= 2 AND category = 'A'
+ORDER BY revenue DESC;
+----
+A 300
+A 200
+
+# Test AND predicate where both conditions stay above the window
+# (using a condition that references the window output so it can't be pushed down)
+query TII
+SELECT category, revenue, rn
+FROM (
+    SELECT
+        category,
+        revenue,
+        ROW_NUMBER() OVER (PARTITION BY category ORDER BY revenue DESC) as rn
+    FROM and_pred_test
+) t
+WHERE rn <= 2 AND rn >= 1
+ORDER BY category, revenue DESC;
+----
+A 300 1
+A 200 2
+B 600 1
+B 500 2
+
+# Verify plan uses PartitionedTopKSortExec with AND predicate (rn <= 2 AND rn >= 1)
+query TT
+EXPLAIN SELECT category, revenue, rn
+FROM (
+    SELECT
+        category,
+        revenue,
+        ROW_NUMBER() OVER (PARTITION BY category ORDER BY revenue DESC) as rn
+    FROM and_pred_test
+) t
+WHERE rn <= 2 AND rn >= 1;
+----
+logical_plan
+01)SubqueryAlias: t
+02)--Projection: and_pred_test.category, and_pred_test.revenue, row_number() PARTITION BY [and_pred_test.category] ORDER BY [and_pred_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW AS rn
+03)----Filter: row_number() PARTITION BY [and_pred_test.category] ORDER BY [and_pred_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW <= UInt64(2) AND row_number() PARTITION BY [and_pred_test.category] ORDER BY [and_pred_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW >= UInt64(1)
+04)------WindowAggr: windowExpr=[[row_number() PARTITION BY [and_pred_test.category] ORDER BY [and_pred_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
+05)--------TableScan: and_pred_test projection=[category, revenue]
+physical_plan
+01)ProjectionExec: expr=[category@0 as category, revenue@1 as revenue, row_number() PARTITION BY [and_pred_test.category] ORDER BY [and_pred_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@2 as rn]
+02)--FilterExec: row_number() PARTITION BY [and_pred_test.category] ORDER BY [and_pred_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@2 <= 2 AND row_number() PARTITION BY [and_pred_test.category] ORDER BY [and_pred_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@2 >= 1
+03)----BoundedWindowAggExec: wdw=[row_number() PARTITION BY [and_pred_test.category] ORDER BY [and_pred_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Field { "row_number() PARTITION BY [and_pred_test.category] ORDER BY [and_pred_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW": UInt64 }, frame: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
+04)------PartitionedTopKSortExec: partition_by=[category@0 ASC NULLS LAST], order_by=[revenue@1 DESC], fetch=2
+05)--------DataSourceExec: partitions=1, partition_sizes=[1]
+
+statement ok
+DROP TABLE and_pred_test;
+
+# =====================================================
+# Test with reversed comparison (e.g., 2 >= rn)
+# =====================================================
+
+statement ok
+CREATE TABLE rev_cmp_test (
+    category VARCHAR,
+    revenue INT
+) AS VALUES
+    ('A', 100), ('A', 200), ('A', 300),
+    ('B', 400), ('B', 500), ('B', 600);
+
+# Reversed comparison: literal >= column
+query TI
+SELECT category, revenue
+FROM (
+    SELECT
+        category,
+        revenue,
+        ROW_NUMBER() OVER (PARTITION BY category ORDER BY revenue DESC) as rn
+    FROM rev_cmp_test
+) t
+WHERE 2 >= rn
+ORDER BY category, revenue DESC;
+----
+A 300
+A 200
+B 600
+B 500
+
+# Verify plan uses PartitionedTopKSortExec with reversed comparison
+query TT
+EXPLAIN SELECT category, revenue
+FROM (
+    SELECT
+        category,
+        revenue,
+        ROW_NUMBER() OVER (PARTITION BY category ORDER BY revenue DESC) as rn
+    FROM rev_cmp_test
+) t
+WHERE 2 >= rn;
+----
+logical_plan
+01)SubqueryAlias: t
+02)--Projection: rev_cmp_test.category, rev_cmp_test.revenue
+03)----Filter: row_number() PARTITION BY [rev_cmp_test.category] ORDER BY [rev_cmp_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW <= UInt64(2)
+04)------WindowAggr: windowExpr=[[row_number() PARTITION BY [rev_cmp_test.category] ORDER BY [rev_cmp_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
+05)--------TableScan: rev_cmp_test projection=[category, revenue]
+physical_plan
+01)FilterExec: row_number() PARTITION BY [rev_cmp_test.category] ORDER BY [rev_cmp_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@2 <= 2, projection=[category@0, revenue@1]
+02)--BoundedWindowAggExec: wdw=[row_number() PARTITION BY [rev_cmp_test.category] ORDER BY [rev_cmp_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Field { "row_number() PARTITION BY [rev_cmp_test.category] ORDER BY [rev_cmp_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW": UInt64 }, frame: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
+03)----PartitionedTopKSortExec: partition_by=[category@0 ASC NULLS LAST], order_by=[revenue@1 DESC], fetch=2
+04)------DataSourceExec: partitions=1, partition_sizes=[1]
+
+statement ok
+DROP TABLE rev_cmp_test;
+
+# =====================================================
+# Test with ROW_NUMBER not as first window expression (P0 fix)
+# =====================================================
+
+statement ok
+CREATE TABLE multi_win_test (
+    category VARCHAR,
+    revenue INT
+) AS VALUES
+    ('A', 100), ('A', 200), ('A', 300),
+    ('B', 400), ('B', 500), ('B', 600);
+
+# ROW_NUMBER is the SECOND window expression (SUM is first)
+# Both share the same PARTITION BY / ORDER BY
+# Must SELECT running_sum to prevent the optimizer from pruning SUM
+query TIII
+SELECT category, revenue, running_sum, rn
+FROM (
+    SELECT
+        category,
+        revenue,
+        SUM(revenue) OVER (PARTITION BY category ORDER BY revenue DESC) as running_sum,
+        ROW_NUMBER() OVER (PARTITION BY category ORDER BY revenue DESC) as rn
+    FROM multi_win_test
+) t
+WHERE rn <= 2
+ORDER BY category, revenue DESC;
+----
+A 300 300 1
+A 200 500 2
+B 600 600 1
+B 500 1100 2
+
+# Verify plan uses PartitionedTopKSortExec when ROW_NUMBER is 2nd window expr
+query TT
+EXPLAIN SELECT category, revenue, running_sum, rn
+FROM (
+    SELECT
+        category,
+        revenue,
+        SUM(revenue) OVER (PARTITION BY category ORDER BY revenue DESC) as running_sum,
+        ROW_NUMBER() OVER (PARTITION BY category ORDER BY revenue DESC) as rn
+    FROM multi_win_test
+) t
+WHERE rn <= 2;
+----
+logical_plan
+01)SubqueryAlias: t
+02)--Projection: multi_win_test.category, multi_win_test.revenue, sum(multi_win_test.revenue) PARTITION BY [multi_win_test.category] ORDER BY [multi_win_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW AS running_sum, row_number() PARTITION BY [multi_win_test.category] ORDER BY [multi_win_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW AS rn
+03)----Filter: row_number() PARTITION BY [multi_win_test.category] ORDER BY [multi_win_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW <= UInt64(2)
+04)------WindowAggr: windowExpr=[[sum(CAST(multi_win_test.revenue AS Int64)) PARTITION BY [multi_win_test.category] ORDER BY [multi_win_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, row_number() PARTITION BY [multi_win_test.category] ORDER BY [multi_win_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
+05)--------TableScan: multi_win_test projection=[category, revenue]
+physical_plan
+01)ProjectionExec: expr=[category@0 as category, revenue@1 as revenue, sum(multi_win_test.revenue) PARTITION BY [multi_win_test.category] ORDER BY [multi_win_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@2 as running_sum, row_number() PARTITION BY [multi_win_test.category] ORDER BY [multi_win_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@3 as rn]
+02)--FilterExec: row_number() PARTITION BY [multi_win_test.category] ORDER BY [multi_win_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@3 <= 2
+03)----BoundedWindowAggExec: wdw=[sum(multi_win_test.revenue) PARTITION BY [multi_win_test.category] ORDER BY [multi_win_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Field { "sum(multi_win_test.revenue) PARTITION BY [multi_win_test.category] ORDER BY [multi_win_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW": nullable Int64 }, frame: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, row_number() PARTITION BY [multi_win_test.category] ORDER BY [multi_win_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Field { "row_number() PARTITION BY [multi_win_test.category] ORDER BY [multi_win_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW": UInt64 }, frame: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
+04)------PartitionedTopKSortExec: partition_by=[category@0 ASC NULLS LAST], order_by=[revenue@1 DESC], fetch=2
+05)--------DataSourceExec: partitions=1, partition_sizes=[1]
+
+statement ok
+DROP TABLE multi_win_test;
