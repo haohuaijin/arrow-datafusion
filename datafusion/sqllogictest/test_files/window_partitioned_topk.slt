@@ -607,9 +607,8 @@ CREATE TABLE multi_win_test (
     ('A', 100), ('A', 200), ('A', 300),
     ('B', 400), ('B', 500), ('B', 600);
 
-# ROW_NUMBER is the SECOND window expression (SUM is first)
-# Both share the same PARTITION BY / ORDER BY
-# Must SELECT running_sum to prevent the optimizer from pruning SUM
+# Multiple window expressions share the same PARTITION BY / ORDER BY.
+# WindowTopK should not apply unless there is exactly one window expression.
 query TIII
 SELECT category, revenue, running_sum, rn
 FROM (
@@ -628,7 +627,7 @@ A 200 500 2
 B 600 600 1
 B 500 1100 2
 
-# Verify plan uses PartitionedTopKSortExec when ROW_NUMBER is 2nd window expr
+# Verify plan does NOT use PartitionedTopKSortExec with multiple window exprs
 query TT
 EXPLAIN SELECT category, revenue, running_sum, rn
 FROM (
@@ -651,7 +650,7 @@ physical_plan
 01)ProjectionExec: expr=[category@0 as category, revenue@1 as revenue, sum(multi_win_test.revenue) PARTITION BY [multi_win_test.category] ORDER BY [multi_win_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@2 as running_sum, row_number() PARTITION BY [multi_win_test.category] ORDER BY [multi_win_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@3 as rn]
 02)--FilterExec: row_number() PARTITION BY [multi_win_test.category] ORDER BY [multi_win_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@3 <= 2
 03)----BoundedWindowAggExec: wdw=[sum(multi_win_test.revenue) PARTITION BY [multi_win_test.category] ORDER BY [multi_win_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Field { "sum(multi_win_test.revenue) PARTITION BY [multi_win_test.category] ORDER BY [multi_win_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW": nullable Int64 }, frame: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, row_number() PARTITION BY [multi_win_test.category] ORDER BY [multi_win_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Field { "row_number() PARTITION BY [multi_win_test.category] ORDER BY [multi_win_test.revenue DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW": UInt64 }, frame: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
-04)------PartitionedTopKSortExec: partition_by=[category@0 ASC NULLS LAST], order_by=[revenue@1 DESC], fetch=2
+04)------SortExec: expr=[category@0 ASC NULLS LAST, revenue@1 DESC], preserve_partitioning=[false]
 05)--------DataSourceExec: partitions=1, partition_sizes=[1]
 
 statement ok
