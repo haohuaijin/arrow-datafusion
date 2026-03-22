@@ -942,6 +942,10 @@ config_namespace! {
         /// sort key, reducing data volume before the shuffle.
         pub enable_topk_repartition: bool, default = true
 
+        /// When set to true, the optimizer will attempt to optimize per-partition TopK queries
+        /// by replacing Sort with PartitionedTopKSort for ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...) patterns
+        pub enable_window_topk: bool, default = true
+
         /// When set to true, the optimizer will attempt to push down TopK dynamic filters
         /// into the file scan phase.
         pub enable_topk_dynamic_filter_pushdown: bool, default = true
