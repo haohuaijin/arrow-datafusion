@@ -145,6 +145,11 @@ fn try_optimize(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>>
     // (handles AND conjunctions, aliased columns, and any window expr position)
     let topk = find_row_number_limit(filter.predicate(), window, projection)?;
 
+    // Only optimize the simple single-window case.
+    if window.window_expr().len() != 1 {
+        return None;
+    }
+
     let sort = window.input().as_any().downcast_ref::<SortExec>()?;
 
     // Use the matched window expression (not hardcoded [0])
