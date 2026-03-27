@@ -248,6 +248,8 @@ CASES=(
     'few categories, many rows|10|100000'
     'few categories, many rows|50|100000'
     'few categories, many rows|100|100000'
+    'few categories, many rows|1000|100000'
+    'many categories, many rows|10000|10000'
     'many categories, few rows|100000|1000'
     'many categories, few rows|100000|100'
     'many categories, few rows|100000|50'

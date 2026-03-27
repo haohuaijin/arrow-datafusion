@@ -1,0 +1,12 @@
+label                            num_categories   rows_per_category  disable_mb     enable_mb      rss_pct            disable_ms     enable_ms      time_pct          
+-------------------------------- ---------------- ------------------ -------------- -------------- ------------------ -------------- -------------- ------------------
+few categories, many rows        10               100000             112.86         89.76          -20.47%            40.00          10.00          -75.00%           
+few categories, many rows        50               100000             361.51         157.07         -56.55%            245.00         35.00          -85.71%           
+few categories, many rows        100              100000             817.20         182.49         -77.67%            727.50         80.00          -89.00%           
+few categories, many rows        1000             100000             7332.65        325.19         -95.57%            15416.25       661.25         -95.71%           
+many categories, many rows       10000            10000              8824.57        2117.51        -76.00%            6508.75        900.00         -86.17%           
+many categories, few rows        100000           1000               8953.54        3784.55        -57.73%            6615.00        2342.50        -64.59%           
+many categories, few rows        100000           100                939.06         751.88         -19.93%            540.00         363.75         -32.64%           
+many categories, few rows        100000           50                 524.31         556.41         6.12%              275.00         222.50         -19.09%           
+many categories, few rows        100000           10                 150.45         284.47         89.08%             71.25          93.75          31.58%            
+many categories, few rows        100000           1                  158.71         167.82         5.74%              43.75          45.00          2.86%             

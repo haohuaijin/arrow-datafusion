@@ -210,6 +210,10 @@ fn criterion_benchmark(c: &mut Criterion) {
     bench_case(c, &rt, "few categories, many rows", 10, 100_000);
     bench_case(c, &rt, "few categories, many rows", 50, 100_000);
     bench_case(c, &rt, "few categories, many rows", 100, 100_000);
+    bench_case(c, &rt, "few categories, many rows", 1_000, 100_000);
+
+    // Case 2: Many number of categories with many rows
+    bench_case(c, &rt, "many categories, many rows", 10_000, 10_000);
 
     // Case 2: Large number of categories with few rows per category
     bench_case(c, &rt, "many categories, few rows", 100_000, 1_000);
