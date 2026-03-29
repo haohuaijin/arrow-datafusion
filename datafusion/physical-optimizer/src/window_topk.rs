@@ -18,6 +18,12 @@
 //! [`WindowTopK`] optimizes `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...) < N`
 //! patterns by replacing the [`SortExec`] with a [`PartitionedTopKSortExec`].
 //!
+//! When `window_topk_min_partition_ndv` in optimizer options is greater than `1`, the rewrite
+//! is applied only if input statistics yield an estimated partition-group count `G` and
+//! `G * K * T <= N`, where `K` is the TopK limit, `T` is that setting, and `N` is the estimated
+//! row count on the sort input. If statistics are missing or unusable, the gate is skipped and
+//! the rule may still apply.
+//!
 //! For example, the following plan:
 //! ```text
 //! FilterExec: row_number < 10
@@ -37,8 +43,9 @@
 use std::sync::Arc;
 
 use crate::PhysicalOptimizerRule;
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Schema};
 use datafusion_common::Result;
+use datafusion_common::Statistics;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_expr::Operator;
@@ -95,7 +102,7 @@ impl PhysicalOptimizerRule for WindowTopK {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if config.optimizer.enable_window_topk {
             plan.transform_down(|plan| {
-                Ok(if let Some(plan) = try_optimize(&plan) {
+                Ok(if let Some(plan) = try_optimize(&plan, config) {
                     Transformed::yes(plan)
                 } else {
                     Transformed::no(plan)
@@ -118,7 +125,10 @@ impl PhysicalOptimizerRule for WindowTopK {
 
 /// Try to match Filter -> (Projection)? -> Window -> Sort and replace
 /// the SortExec with a PartitionedTopKSortExec.
-fn try_optimize(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+fn try_optimize(
+    plan: &Arc<dyn ExecutionPlan>,
+    config: &ConfigOptions,
+) -> Option<Arc<dyn ExecutionPlan>> {
     let filter = plan.as_any().downcast_ref::<FilterExec>()?;
 
     // Navigate through optional projection to find window.
@@ -166,6 +176,10 @@ fn try_optimize(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>>
         return None;
     }
     if !sort_exprs_match(&sort.expr()[partition_len..], order_by) {
+        return None;
+    }
+
+    if !should_apply_partitioned_topk_sort(sort, partition_by, topk.limit, config) {
         return None;
     }
 
@@ -352,4 +366,176 @@ fn sort_exprs_match(
             .iter()
             .zip(sort_exprs2.iter())
             .all(|(e1, e2)| e1.expr.eq(&e2.expr) && e1.options == e2.options)
+}
+
+/// Returns whether to replace `SortExec` with `PartitionedTopKSortExec`, using
+/// `window_topk_min_partition_ndv` (`T`) as a cost gate when `T > 1`:
+/// apply iff `G * K * T <= N` (with `G` = estimated partition groups, `K` = `limit`, `N` = rows).
+fn should_apply_partitioned_topk_sort(
+    sort: &SortExec,
+    partition_by: &[Arc<dyn PhysicalExpr>],
+    limit: usize,
+    config: &ConfigOptions,
+) -> bool {
+    let threshold = config.optimizer.window_topk_min_partition_ndv;
+    if threshold <= 1 {
+        return true;
+    }
+    if partition_by.is_empty() {
+        return false;
+    }
+
+    let Ok(stats) = sort.input().partition_statistics(None) else {
+        return false;
+    };
+
+    let input_schema = sort.input().schema();
+    let Some(estimated_groups) = estimate_partition_group_count(
+        stats.as_ref(),
+        partition_by,
+        input_schema.as_ref(),
+    ) else {
+        return false;
+    };
+
+    let total_rows = stats.num_rows.get_value().copied().unwrap_or(0);
+
+    estimated_groups * limit * threshold <= total_rows
+}
+
+/// Returns `G`, an estimate of the number of partition groups from column `distinct_count`
+/// values (capped by estimated row count), or `None` when any partition key is not a bare
+/// column, lacks a known `distinct_count`, or column statistics do not match `input_schema`.
+///
+/// Partition columns are resolved by **name** against `input_schema` so statistics align with
+/// the sort input schema even when physical column indices differ from catalog order.
+fn estimate_partition_group_count(
+    stats: &Statistics,
+    partition_by: &[Arc<dyn PhysicalExpr>],
+    input_schema: &Schema,
+) -> Option<usize> {
+    if stats.column_statistics.len() != input_schema.fields().len() {
+        return None;
+    }
+
+    let mut product = 1usize;
+    for expr in partition_by {
+        let col = expr.as_any().downcast_ref::<Column>()?;
+        let idx = input_schema.index_of(col.name()).ok()?;
+        let col_stats = stats.column_statistics.get(idx)?;
+        let dc = col_stats.distinct_count.get_value().copied()?;
+        product = product.checked_mul(dc)?;
+    }
+
+    let capped = stats
+        .num_rows
+        .get_value()
+        .copied()
+        .map(|n| product.min(n))
+        .unwrap_or(product);
+    Some(capped.max(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{Field, Schema};
+    use datafusion_common::ColumnStatistics;
+    use datafusion_common::stats::Precision;
+
+    #[test]
+    fn estimate_partition_groups_single_key() {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]);
+        let col_a = Column::new("a", 0);
+        let stats = Statistics {
+            num_rows: Precision::Exact(1_000),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![
+                ColumnStatistics::new_unknown().with_distinct_count(Precision::Exact(50)),
+                ColumnStatistics::new_unknown(),
+            ],
+        };
+        let est =
+            estimate_partition_group_count(&stats, &[Arc::new(col_a) as _], &schema);
+        assert_eq!(est, Some(50));
+    }
+
+    #[test]
+    fn estimate_partition_groups_resolves_by_column_name() {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]);
+        // Stale/wrong index: still resolves "a" by name for statistics lookup.
+        let col_a = Column::new("a", 99);
+        let stats = Statistics {
+            num_rows: Precision::Exact(1_000),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![
+                ColumnStatistics::new_unknown().with_distinct_count(Precision::Exact(77)),
+                ColumnStatistics::new_unknown(),
+            ],
+        };
+        let est =
+            estimate_partition_group_count(&stats, &[Arc::new(col_a) as _], &schema);
+        assert_eq!(est, Some(77));
+    }
+
+    #[test]
+    fn estimate_partition_groups_product_capped_by_num_rows() {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]);
+        let col_a = Column::new("a", 0);
+        let col_b = Column::new("b", 1);
+        let stats = Statistics {
+            num_rows: Precision::Exact(20),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![
+                ColumnStatistics::new_unknown().with_distinct_count(Precision::Exact(10)),
+                ColumnStatistics::new_unknown().with_distinct_count(Precision::Exact(10)),
+            ],
+        };
+        let est = estimate_partition_group_count(
+            &stats,
+            &[Arc::new(col_a) as _, Arc::new(col_b) as _],
+            &schema,
+        );
+        assert_eq!(est, Some(20));
+    }
+
+    #[test]
+    fn estimate_partition_groups_unknown_distinct() {
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let col_a = Column::new("a", 0);
+        let stats = Statistics {
+            num_rows: Precision::Exact(100),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics::new_unknown()],
+        };
+        let est =
+            estimate_partition_group_count(&stats, &[Arc::new(col_a) as _], &schema);
+        assert_eq!(est, None);
+    }
+
+    #[test]
+    fn estimate_partition_groups_rejects_mismatched_stats_schema_len() {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]);
+        let col_a = Column::new("a", 0);
+        let stats = Statistics {
+            num_rows: Precision::Exact(100),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics::new_unknown()],
+        };
+        let est =
+            estimate_partition_group_count(&stats, &[Arc::new(col_a) as _], &schema);
+        assert_eq!(est, None);
+    }
 }

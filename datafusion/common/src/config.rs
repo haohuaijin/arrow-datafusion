@@ -946,6 +946,20 @@ config_namespace! {
         /// by replacing Sort with PartitionedTopKSort for ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...) patterns
         pub enable_window_topk: bool, default = true
 
+        /// Cost gate for the window TopK rule (`SortExec` → `PartitionedTopKSortExec`).
+        ///
+        /// When this value is `0` or `1`, the gate is off and the rule applies whenever
+        /// `enable_window_topk` matches a plan.
+        ///
+        /// When the value is `T > 1`, let `G` be the estimated number of partition groups
+        /// (product of `distinct_count` on each PARTITION BY column, capped by estimated
+        /// row count), `K` the TopK limit from the predicate, and `N` the estimated input
+        /// row count from [`Statistics::num_rows`] on the sort input. The rule applies only if
+        /// `G * K * T <= N`. Partition keys must be plain column references with a known
+        /// `distinct_count`, and column statistics must align with the sort input schema;
+        /// otherwise the gate is skipped (the rule may apply).
+        pub window_topk_min_partition_ndv: usize, default = 10
+
         /// When set to true, the optimizer will attempt to push down TopK dynamic filters
         /// into the file scan phase.
         pub enable_topk_dynamic_filter_pushdown: bool, default = true

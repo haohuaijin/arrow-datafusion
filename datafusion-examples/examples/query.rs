@@ -24,19 +24,28 @@
 //! `datafusion/core/benches/window_topk.rs`:
 //! `100000 categories, 1000 rows/category, limit 10`.
 
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow::array::{Int64Builder, StringArray};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::array::{Array, Int64Builder, PrimitiveArray, StringArray};
+use arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
-use datafusion::parquet::arrow::ArrowWriter;
+use datafusion::parquet::arrow::{
+    ArrowSchemaConverter, add_encoded_arrow_schema_to_metadata,
+};
 use datafusion::parquet::basic::Compression;
-use datafusion::parquet::file::properties::WriterProperties;
+use datafusion::parquet::data_type::{
+    ByteArray, ByteArrayType, Int64Type as ParquetInt64Type,
+};
+use datafusion::parquet::file::properties::{EnabledStatistics, WriterProperties};
+use datafusion::parquet::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
+use datafusion::parquet::schema::types::TypePtr;
 use datafusion::prelude::ParquetReadOptions;
 use datafusion::prelude::*;
+use datafusion_common::instant::Instant;
 use rand::Rng;
 use rand::SeedableRng;
 use rand::prelude::SliceRandom;
@@ -103,10 +112,10 @@ async fn run_window_topk(ctx: &SessionContext, limit: usize) -> Result<()> {
          WHERE rn <= {limit}"
     );
 
-    let start = std::time::Instant::now();
-    let _ = ctx.sql(&sql).await?.show().await?;
+    let start = Instant::now();
+    ctx.sql(&sql).await?.show().await?;
     let elapsed = start.elapsed();
-    println!("Elapsed: {:?}", elapsed);
+    println!("Elapsed: {elapsed:?}");
     Ok(())
 }
 
@@ -126,6 +135,17 @@ fn ensure_parquet_data(
     fs::create_dir_all(&parquet_dir)?;
 
     let (schema, partitions) = make_window_data(rows_per_category, num_categories)?;
+    let parquet_root: TypePtr = ArrowSchemaConverter::new()
+        .convert(schema.as_ref())
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .root_schema_ptr();
+    let mut writer_props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(Default::default()))
+        .set_statistics_enabled(EnabledStatistics::Chunk)
+        .build();
+    add_encoded_arrow_schema_to_metadata(schema.as_ref(), &mut writer_props);
+    let writer_props = Arc::new(writer_props);
+
     for parquet_file in &expected_files {
         if parquet_file.exists() {
             fs::remove_file(parquet_file)?;
@@ -133,7 +153,13 @@ fn ensure_parquet_data(
     }
 
     for (partition_idx, batches) in partitions.iter().enumerate() {
-        write_partition(&expected_files[partition_idx], Arc::clone(&schema), batches)?;
+        write_partition(
+            &expected_files[partition_idx],
+            &schema,
+            parquet_root.clone(),
+            Arc::clone(&writer_props),
+            batches,
+        )?;
     }
 
     Ok(parquet_dir)
@@ -153,23 +179,153 @@ fn partition_paths(parquet_dir: &Path) -> Vec<PathBuf> {
 
 fn write_partition(
     path: &Path,
-    schema: SchemaRef,
+    schema: &SchemaRef,
+    parquet_root: TypePtr,
+    writer_props: Arc<WriterProperties>,
     batches: &[RecordBatch],
 ) -> Result<()> {
     let file = File::create(path)?;
-    let options = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(Default::default()))
-        .build();
-    let mut writer = ArrowWriter::try_new(file, schema, Some(options))
+    let mut writer = SerializedFileWriter::new(file, parquet_root, writer_props)
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     for batch in batches {
-        writer
-            .write(batch)
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        if batch.schema().as_ref() != schema.as_ref() {
+            return Err(DataFusionError::Execution(
+                "partition batch schema does not match sales schema".to_string(),
+            ));
+        }
+
+        let mut row_group = writer
+            .next_row_group()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        write_string_column_with_distinct_count(
+            &mut row_group,
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution("category column must be Utf8".to_string())
+                })?,
+        )?;
+
+        write_i64_column(
+            &mut row_group,
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<PrimitiveArray<Int64Type>>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "product_id column must be Int64".to_string(),
+                    )
+                })?,
+        )?;
+
+        write_i64_column(
+            &mut row_group,
+            batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<PrimitiveArray<Int64Type>>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution("revenue column must be Int64".to_string())
+                })?,
+        )?;
+
+        row_group
+            .close()
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
     }
 
     writer
+        .close()
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    Ok(())
+}
+
+fn write_string_column_with_distinct_count<W: std::io::Write + Send>(
+    row_group: &mut SerializedRowGroupWriter<'_, W>,
+    values: &StringArray,
+) -> Result<()> {
+    let mut col_writer = row_group
+        .next_column()
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .ok_or_else(|| {
+            DataFusionError::Execution("missing Parquet column".to_string())
+        })?;
+
+    let len = values.len();
+    if len == 0 {
+        col_writer
+            .close()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        return Ok(());
+    }
+
+    let mut distinct: HashSet<&str> = HashSet::new();
+    let mut min_s: Option<&str> = None;
+    let mut max_s: Option<&str> = None;
+    for i in 0..len {
+        let s = values.value(i);
+        distinct.insert(s);
+        min_s = Some(match min_s {
+            None => s,
+            Some(m) => m.min(s),
+        });
+        max_s = Some(match max_s {
+            None => s,
+            Some(m) => m.max(s),
+        });
+    }
+
+    let parquet_values: Vec<ByteArray> = (0..len)
+        .map(|i| ByteArray::from(values.value(i).as_bytes()))
+        .collect();
+
+    let min_ba = ByteArray::from(min_s.unwrap().as_bytes());
+    let max_ba = ByteArray::from(max_s.unwrap().as_bytes());
+    let distinct_count = distinct.len() as u64;
+
+    col_writer
+        .typed::<ByteArrayType>()
+        .write_batch_with_statistics(
+            parquet_values.as_slice(),
+            None,
+            None,
+            Some(&min_ba),
+            Some(&max_ba),
+            Some(distinct_count),
+        )
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    col_writer
+        .close()
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    Ok(())
+}
+
+fn write_i64_column<W: std::io::Write + Send>(
+    row_group: &mut SerializedRowGroupWriter<'_, W>,
+    values: &PrimitiveArray<Int64Type>,
+) -> Result<()> {
+    let mut col_writer = row_group
+        .next_column()
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .ok_or_else(|| {
+            DataFusionError::Execution("missing Parquet column".to_string())
+        })?;
+
+    col_writer
+        .typed::<ParquetInt64Type>()
+        .write_batch(values.values().as_ref(), None, None)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    col_writer
         .close()
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     Ok(())
