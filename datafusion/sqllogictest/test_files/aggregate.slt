@@ -6991,7 +6991,7 @@ SELECT STRING_AGG(DISTINCT x,'|' ORDER BY x) FROM strings
 ----
 a|b|i|j|p|x|y|z
 
-query error This feature is not implemented: The second argument of the string_agg function must be a string literal
+query error This feature is not implemented: string_agg delimiter must be a string literal
 SELECT STRING_AGG(DISTINCT x,y) FROM strings
 
 query error Execution error: In an aggregate with DISTINCT, ORDER BY expressions must appear in argument list
@@ -7941,21 +7941,16 @@ select count(), count() * count() from t;
 ----
 2 4
 
-# DataFusion error: Error during planning: Projections require unique expression names but the expression "count\(Int64\(1\)\)" at position 0 and "count\(Int64\(1\)\)" at position 1 have the same name\. Consider aliasing \("AS"\) one of them\.
-query error
+# Duplicate aggregate expressions are now auto-suffixed
+query II
 select count(1), count(1) from t;
+----
+2 2
 
-# DataFusion error: Error during planning: Projections require unique expression names but the expression "count\(Int64\(1\)\)" at position 0 and "count\(Int64\(1\)\)" at position 1 have the same name\. Consider aliasing \("AS"\) one of them\.
-query error
-explain select count(1), count(1) from t;
-
-# DataFusion error: Error during planning: Projections require unique expression names but the expression "count\(Int64\(1\) AS \)" at position 0 and "count\(Int64\(1\) AS \)" at position 1 have the same name\. Consider aliasing \("AS"\) one of them\.
-query error
+query II
 select count(), count() from t;
-
-# DataFusion error: Error during planning: Projections require unique expression names but the expression "count\(Int64\(1\) AS \)" at position 0 and "count\(Int64\(1\) AS \)" at position 1 have the same name\. Consider aliasing \("AS"\) one of them\.
-query error
-explain select count(), count() from t;
+----
+2 2
 
 query II
 select count(1), count(2) from t;
@@ -8778,9 +8773,12 @@ ORDER BY g;
 2 2 1.5 1.5 1.5 1.5 1.5 1.5 1.5 1.5
 3 2 1.5 1.5 1.5 1.5 1.5 1.5 1.5 1.5
 
-statement ok
-DROP TABLE stream_test;
+# Config reset
 
-# Restore default target partitions
+# The SLT runner sets `target_partitions` to 4 instead of using the default, so 
+# reset it explicitly.
 statement ok
 set datafusion.execution.target_partitions = 4;
+
+statement ok
+DROP TABLE stream_test;

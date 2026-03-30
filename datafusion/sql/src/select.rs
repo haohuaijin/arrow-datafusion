@@ -23,8 +23,9 @@ use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 use crate::query::to_order_by_exprs_with_select;
 use crate::utils::{
     CheckColumnsMustReferenceAggregatePurpose, CheckColumnsSatisfyExprsPurpose,
-    check_columns_satisfy_exprs, extract_aliases, rebase_expr, resolve_aliases_to_exprs,
-    resolve_columns, resolve_positions_to_exprs, rewrite_recursive_unnests_bottom_up,
+    check_columns_satisfy_exprs, deduplicate_select_expr_names, extract_aliases,
+    rebase_expr, resolve_aliases_to_exprs, resolve_columns, resolve_positions_to_exprs,
+    rewrite_recursive_unnests_bottom_up,
 };
 
 use datafusion_common::error::DataFusionErrorBuilder;
@@ -108,6 +109,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             empty_from,
             planner_context,
         )?;
+
+        // Auto-suffix duplicate expression names (e.g. cov, cov → cov, cov:1)
+        // before projection so that the unique-name constraint is satisfied.
+        let select_exprs = deduplicate_select_expr_names(select_exprs);
 
         // Having and group by clause may reference aliases defined in select projection
         let projected_plan = self.project(base_plan.clone(), select_exprs)?;
@@ -257,7 +262,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             select_exprs: mut select_exprs_post_aggr,
             having_expr: having_expr_post_aggr,
             qualify_expr: qualify_expr_post_aggr,
-            order_by_exprs: order_by_rex,
+            order_by_exprs: mut order_by_rex,
         } = if !group_by_exprs.is_empty() || !aggr_exprs.is_empty() {
             self.aggregate(
                 &base_plan,
@@ -293,14 +298,15 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             plan
         };
 
-        // The outer expressions we will search through for window functions.
-        // Window functions may be sourced from the SELECT list or from the QUALIFY expression.
-        let windows_expr_haystack = select_exprs_post_aggr
-            .iter()
-            .chain(qualify_expr_post_aggr.iter());
         // All of the window expressions (deduplicated and rewritten to reference aggregates as
-        // columns from input).
-        let window_func_exprs = find_window_exprs(windows_expr_haystack);
+        // columns from input). Window functions may be sourced from the SELECT list, QUALIFY
+        // expression, or ORDER BY.
+        let window_func_exprs = find_window_exprs(
+            select_exprs_post_aggr
+                .iter()
+                .chain(qualify_expr_post_aggr.iter())
+                .chain(order_by_rex.iter().map(|s| &s.expr)),
+        );
 
         // Process window functions after aggregation as they can reference
         // aggregate functions in their body
@@ -315,14 +321,30 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 .map(|expr| rebase_expr(expr, &window_func_exprs, &plan))
                 .collect::<Result<Vec<Expr>>>()?;
 
+            order_by_rex = order_by_rex
+                .into_iter()
+                .map(|sort_expr| {
+                    Ok(sort_expr.with_expr(rebase_expr(
+                        &sort_expr.expr,
+                        &window_func_exprs,
+                        &plan,
+                    )?))
+                })
+                .collect::<Result<Vec<_>>>()?;
+
             plan
         };
 
         // Process QUALIFY clause after window functions
         // QUALIFY filters the results of window functions, similar to how HAVING filters aggregates
         let plan = if let Some(qualify_expr) = qualify_expr_post_aggr {
-            // Validate that QUALIFY is used with window functions
-            if window_func_exprs.is_empty() {
+            // Validate that QUALIFY is used with window functions in SELECT or QUALIFY
+            let qualify_window_func_exprs = find_window_exprs(
+                select_exprs_post_aggr
+                    .iter()
+                    .chain(std::iter::once(&qualify_expr)),
+            );
+            if qualify_window_func_exprs.is_empty() {
                 return plan_err!(
                     "QUALIFY clause requires window functions in the SELECT list or QUALIFY clause"
                 );
