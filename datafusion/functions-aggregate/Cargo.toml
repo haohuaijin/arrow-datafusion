@@ -85,6 +85,10 @@ name = "first_last"
 harness = false
 
 [[bench]]
+name = "any_value"
+harness = false
+
+[[bench]]
 name = "count_distinct"
 harness = false
 

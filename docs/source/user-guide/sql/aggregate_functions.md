@@ -80,6 +80,7 @@ SELECT SUM(x) WITHIN GROUP (ORDER BY x) FROM t;
 
 ## General Functions
 
+- [any_value](#any_value)
 - [array_agg](#array_agg)
 - [avg](#avg)
 - [bit_and](#bit_and)
@@ -104,6 +105,29 @@ SELECT SUM(x) WITHIN GROUP (ORDER BY x) FROM t;
 - [var_population](#var_population)
 - [var_samp](#var_samp)
 - [var_sample](#var_sample)
+
+### `any_value`
+
+Returns an arbitrary (non-deterministic) value from the group. `NULL` values are ignored, so a `NULL` is only returned when every value in the group is `NULL`. Unlike `first_value`, no ordering is tracked, which makes it cheaper for cases where any single value will do.
+
+```sql
+any_value(expression)
+```
+
+#### Arguments
+
+- **expression**: The expression to operate on. Can be a constant, column, or function, and any combination of operators.
+
+#### Example
+
+```sql
+> SELECT any_value(column_name) FROM table_name;
++--------------------------+
+| any_value(column_name)   |
++--------------------------+
+| some_value               |
++--------------------------+
+```
 
 ### `array_agg`
 
