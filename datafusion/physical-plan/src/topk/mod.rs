@@ -25,7 +25,7 @@ use arrow::{
     },
     row::{OwnedRow, RowConverter, Rows, SortField},
 };
-use datafusion_expr::{ColumnarValue, Operator};
+use datafusion_expr::{ColumnarValue, EmitTo, Operator};
 use std::mem::size_of;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::{cmp::Ordering, collections::BinaryHeap, sync::Arc};
@@ -38,7 +38,7 @@ use crate::spill::get_record_batch_memory_size;
 use crate::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
 
 use arrow::array::{ArrayRef, RecordBatch, UInt32Array};
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion_common::{
     HashMap, Result, ScalarValue, internal_datafusion_err, internal_err,
 };
@@ -52,6 +52,9 @@ use datafusion_physical_expr::{
 };
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 use parking_lot::RwLock;
+
+use crate::aggregates::group_values::{GroupValues, new_group_values};
+use crate::aggregates::order::GroupOrdering;
 
 /// TopK
 ///
@@ -1247,17 +1250,13 @@ impl RecordBatchStore {
     }
 }
 
-/// Top-K-per-partition operator state.
+/// Top-K-per-partition operator state for `ROW_NUMBER`.
 ///
-/// Sibling to [`TopK`]. Where `TopK` maintains a single global heap,
-/// `PartitionedTopK` maintains one [`TopKHeap`] per distinct partition
-/// key while sharing a single [`RowConverter`], [`MemoryReservation`],
-/// scratch [`Rows`] buffer, and [`TopKMetrics`] across all partitions.
-///
-/// This sharing is the point of the type: with N distinct partition
-/// keys, a naive `HashMap<_, TopK>` pays N × constant overhead for
-/// `RowConverter::new`, `MemoryConsumer::register`, and metric
-/// counter setup. `PartitionedTopK` pays it once.
+/// Partition keys are interned by [`GroupValues`] and represented by dense group
+/// identifiers. Each group owns a lightweight [`PartitionedGroupHeap`] whose
+/// entries reference an operator-wide shared batch store. This avoids creating
+/// an `OwnedRow`, an index vector, and a gathered sub-batch for every distinct
+/// partition present in each input batch.
 pub(crate) struct PartitionedTopK {
     schema: SchemaRef,
     metrics: TopKMetrics,
@@ -1270,10 +1269,20 @@ pub(crate) struct PartitionedTopK {
     scratch_rows: Rows,
     /// PARTITION BY expressions.
     partition_exprs: Vec<Arc<dyn PhysicalExpr>>,
-    /// Encoder for the partition key.
-    partition_converter: RowConverter,
-    /// One heap per distinct partition key seen so far.
-    heaps: HashMap<OwnedRow, TopKHeap>,
+    /// Encoder used to sort the interned partition keys at emit time.
+    partition_order_converter: RowConverter,
+    /// Interns partition keys and assigns dense group identifiers.
+    group_values: Box<dyn GroupValues>,
+    /// One lightweight heap per interned partition key.
+    group_heaps: Vec<PartitionedGroupHeap>,
+    /// Reused output buffer for [`GroupValues::intern`].
+    group_indices: Vec<usize>,
+    /// Input batches retained once per operator rather than once per group.
+    shared_batches: Vec<RecordBatch>,
+    /// Number of live heap entries referencing each shared batch.
+    shared_batch_uses: Vec<usize>,
+    /// Bytes owned by encoded ORDER BY keys in all group heaps.
+    heap_owned_bytes: usize,
     k: usize,
     batch_size: usize,
 }
@@ -1300,7 +1309,20 @@ impl PartitionedTopK {
         let scratch_rows =
             row_converter.empty_rows(batch_size, ESTIMATED_BYTES_PER_ROW * batch_size);
 
-        let partition_converter = RowConverter::new(partition_sort_fields)?;
+        let partition_fields = partition_exprs
+            .iter()
+            .enumerate()
+            .map(|(index, expr)| {
+                Ok(Field::new(
+                    format!("partition_{index}"),
+                    expr.data_type(&schema)?,
+                    expr.nullable(&schema)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let partition_schema = Arc::new(Schema::new(partition_fields));
+        let group_values = new_group_values(partition_schema, &GroupOrdering::None)?;
+        let partition_order_converter = RowConverter::new(partition_sort_fields)?;
 
         Ok(Self {
             schema,
@@ -1310,16 +1332,20 @@ impl PartitionedTopK {
             row_converter,
             scratch_rows,
             partition_exprs,
-            partition_converter,
-            heaps: HashMap::new(),
+            partition_order_converter,
+            group_values,
+            group_heaps: Vec::new(),
+            group_indices: Vec::new(),
+            shared_batches: Vec::new(),
+            shared_batch_uses: Vec::new(),
+            heap_owned_bytes: 0,
             k,
             batch_size,
         })
     }
 
-    /// Demultiplex `batch` rows by partition key, encode the ORDER BY
-    /// columns once for the whole batch, and feed each partition's
-    /// rows into its dedicated [`TopKHeap`].
+    /// Intern partition keys, encode ORDER BY values once for the whole batch,
+    /// and dispatch every row directly to its partition's heap.
     pub(crate) fn insert_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         let baseline = self.metrics.baseline.clone();
         let _timer = baseline.elapsed_compute().timer();
@@ -1329,133 +1355,282 @@ impl PartitionedTopK {
             return Ok(());
         }
 
-        // 1. Evaluate + encode partition columns.
-        let pk_arrays: Vec<ArrayRef> = self
+        let partition_arrays = self
             .partition_exprs
             .iter()
-            .map(|e| e.evaluate(batch).and_then(|v| v.into_array(num_rows)))
-            .collect::<Result<_>>()?;
-        let pk_rows = self.partition_converter.convert_columns(&pk_arrays)?;
+            .map(|expr| expr.evaluate(batch).and_then(|v| v.into_array(num_rows)))
+            .collect::<Result<Vec<ArrayRef>>>()?;
+        self.group_indices.clear();
+        self.group_values
+            .intern(&partition_arrays, &mut self.group_indices)?;
 
-        // 2. Demultiplex row indices by partition key (per-batch).
-        let mut groups: HashMap<OwnedRow, Vec<u32>> = HashMap::new();
-        for i in 0..num_rows {
-            groups
-                .entry(pk_rows.row(i).owned())
-                .or_default()
-                .push(i as u32);
+        while self.group_heaps.len() < self.group_values.len() {
+            self.group_heaps.push(PartitionedGroupHeap::new(self.k));
         }
 
-        // 3. Evaluate ORDER BY columns on the full batch and encode ONCE.
-        let ob_arrays: Vec<ArrayRef> = self
+        let order_arrays = self
             .expr
             .iter()
-            .map(|e| e.expr.evaluate(batch).and_then(|v| v.into_array(num_rows)))
-            .collect::<Result<_>>()?;
+            .map(|expr| {
+                expr.expr
+                    .evaluate(batch)
+                    .and_then(|v| v.into_array(num_rows))
+            })
+            .collect::<Result<Vec<ArrayRef>>>()?;
         self.scratch_rows.clear();
         self.row_converter
-            .append(&mut self.scratch_rows, &ob_arrays)?;
+            .append(&mut self.scratch_rows, &order_arrays)?;
 
-        // 4. Per-partition: take the sub-batch, walk indices, dispatch
-        //    qualifying rows into the partition's heap.
-        let k = self.k;
-        let mut replacements: usize = 0;
-        for (pk, indices) in groups {
-            let heap = self.heaps.entry(pk).or_insert_with(|| TopKHeap::new(k));
+        let batch_idx = u32::try_from(self.shared_batches.len()).map_err(|_| {
+            internal_datafusion_err!("PartitionedTopK shared batch index overflow")
+        })?;
+        let mut batch_registered = false;
+        let mut replacements = 0;
 
-            // Once a heap is full, most rows at high partition cardinality
-            // are rejected. Skip the gather + batch registration entirely
-            // when nothing in this partition group can improve the heap.
-            let any_qualify = indices.iter().any(|&orig_idx| {
-                let bytes = self.scratch_rows.row(orig_idx as usize);
-                match heap.max() {
-                    Some(max_row) => bytes.as_ref() < max_row.row(),
-                    None => true,
-                }
-            });
-            if !any_qualify {
+        for (row_idx, &group_id) in self.group_indices.iter().enumerate() {
+            let row = self.scratch_rows.row(row_idx);
+            let heap = &self.group_heaps[group_id];
+            if heap
+                .max()
+                .is_some_and(|boundary| row.as_ref() >= boundary.row.as_slice())
+            {
                 continue;
             }
 
-            let indices_arr = UInt32Array::from(indices);
-            let sub_batch = take_record_batch(batch, &indices_arr)?;
-            let mut entry = heap.register_batch(sub_batch);
-
-            for (sub_idx, &orig_idx) in indices_arr.values().iter().enumerate() {
-                let row = self.scratch_rows.row(orig_idx as usize);
-                match heap.max() {
-                    Some(max_row) if row.as_ref() >= max_row.row() => {}
-                    None | Some(_) => {
-                        heap.add(&mut entry, row, sub_idx);
-                        replacements += 1;
-                    }
-                }
+            if !batch_registered {
+                self.shared_batches.push(batch.clone());
+                self.shared_batch_uses.push(0);
+                batch_registered = true;
             }
 
-            heap.insert_batch_entry(entry);
-            heap.maybe_compact()?;
+            let evicted_batch_idx = {
+                let heap = &self.group_heaps[group_id];
+                (heap.inner.len() == heap.k).then(|| {
+                    heap.inner
+                        .peek()
+                        .expect("full heap has a boundary")
+                        .batch_idx
+                })
+            };
+            if let Some(evicted_batch_idx) = evicted_batch_idx {
+                let uses = &mut self.shared_batch_uses[evicted_batch_idx as usize];
+                *uses = uses.checked_sub(1).ok_or_else(|| {
+                    internal_datafusion_err!(
+                        "PartitionedTopK shared batch use count underflow"
+                    )
+                })?;
+            }
+
+            self.heap_owned_bytes +=
+                self.group_heaps[group_id].add(row.as_ref(), batch_idx, row_idx);
+            self.shared_batch_uses[batch_idx as usize] += 1;
+            replacements += 1;
         }
 
         if replacements > 0 {
             self.metrics.row_replacements.add(replacements);
         }
+        self.maybe_compact()?;
         self.reservation.try_resize(self.size())?;
         Ok(())
     }
 
-    /// Drain all heaps in partition-key order and return the rows as
-    /// a stream of coalesced `RecordBatch`es ordered by
-    /// `(partition_keys, order_keys)`.
-    pub(crate) fn emit(self) -> Result<SendableRecordBatchStream> {
-        let Self {
-            schema,
-            metrics,
-            reservation: _,
-            expr: _,
-            row_converter: _,
-            scratch_rows: _,
-            partition_exprs: _,
-            partition_converter: _,
-            mut heaps,
-            k: _,
-            batch_size,
-        } = self;
-        let _timer = metrics.baseline.elapsed_compute().timer();
-
-        let mut sorted_pks: Vec<OwnedRow> = heaps.keys().cloned().collect();
-        sorted_pks.sort();
-
-        let mut coalescer = BatchCoalescer::new(Arc::clone(&schema), batch_size);
-
-        for pk in sorted_pks {
-            let mut heap = heaps.remove(&pk).expect("key from heaps.keys()");
-            if let Some(batch) = heap.emit()? {
-                (&batch).record_output(&metrics.baseline);
-                coalescer.push_batch(batch)?;
-            }
+    /// Compact retained batches when unused input rows substantially exceed
+    /// the live top-K state.
+    fn maybe_compact(&mut self) -> Result<()> {
+        if self.shared_batches.len() <= 2 {
+            return Ok(());
         }
-        coalescer.finish_buffered_batch()?;
 
-        let mut out: Vec<Result<RecordBatch>> = Vec::new();
-        while let Some(b) = coalescer.next_completed_batch() {
-            out.push(Ok(b));
+        let total_batch_rows = self
+            .shared_batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>();
+        let total_used = self.shared_batch_uses.iter().sum::<usize>();
+        let unused = total_batch_rows.saturating_sub(total_used);
+        let max_unused = 20 * self.batch_size + self.k * self.group_heaps.len();
+        if unused < max_unused {
+            return Ok(());
+        }
+
+        let mut entries = Vec::with_capacity(total_used);
+        for (group_id, heap) in self.group_heaps.iter_mut().enumerate() {
+            entries.extend(heap.inner.drain().map(|entry| (group_id, entry)));
+        }
+
+        if entries.is_empty() {
+            self.shared_batches.clear();
+            self.shared_batch_uses.clear();
+            return Ok(());
+        }
+
+        let batch_refs = self.shared_batches.iter().collect::<Vec<_>>();
+        let indices = entries
+            .iter()
+            .map(|(_, entry)| (entry.batch_idx as usize, entry.row_idx))
+            .collect::<Vec<_>>();
+        let compacted = interleave_record_batch(&batch_refs, &indices)?;
+
+        self.shared_batches.clear();
+        self.shared_batch_uses.clear();
+        self.shared_batches.push(compacted);
+        self.shared_batch_uses.push(entries.len());
+
+        for (row_idx, (group_id, mut entry)) in entries.into_iter().enumerate() {
+            entry.batch_idx = 0;
+            entry.row_idx = row_idx;
+            self.group_heaps[group_id].inner.push(entry);
+        }
+        Ok(())
+    }
+
+    /// Emit all retained rows ordered by partition key and then ORDER BY key.
+    pub(crate) fn emit(mut self) -> Result<SendableRecordBatchStream> {
+        let baseline = self.metrics.baseline.clone();
+        let _timer = baseline.elapsed_compute().timer();
+
+        let num_groups = self.group_values.len();
+        if num_groups == 0 {
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                self.schema,
+                futures::stream::empty(),
+            )));
+        }
+
+        let partition_arrays = self.group_values.emit(EmitTo::All)?;
+        let partition_rows = self
+            .partition_order_converter
+            .convert_columns(&partition_arrays)?;
+        let mut group_order = (0..num_groups).collect::<Vec<_>>();
+        group_order.sort_by(|&left, &right| {
+            partition_rows
+                .row(left)
+                .as_ref()
+                .cmp(partition_rows.row(right).as_ref())
+        });
+
+        let retained_rows = self.group_heaps.iter().map(|h| h.inner.len()).sum();
+        let mut indices = Vec::with_capacity(retained_rows);
+        for group_id in group_order {
+            let entries =
+                std::mem::take(&mut self.group_heaps[group_id].inner).into_sorted_vec();
+            indices.extend(
+                entries
+                    .iter()
+                    .map(|entry| (entry.batch_idx as usize, entry.row_idx)),
+            );
+        }
+
+        if indices.is_empty() {
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                self.schema,
+                futures::stream::empty(),
+            )));
+        }
+
+        let batch_refs = self.shared_batches.iter().collect::<Vec<_>>();
+        let result = interleave_record_batch(&batch_refs, &indices)?;
+        let mut output = Vec::with_capacity(result.num_rows().div_ceil(self.batch_size));
+        for offset in (0..result.num_rows()).step_by(self.batch_size) {
+            let len = self.batch_size.min(result.num_rows() - offset);
+            let batch = result.slice(offset, len);
+            (&batch).record_output(&self.metrics.baseline);
+            output.push(Ok(batch));
         }
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            futures::stream::iter(out),
+            self.schema,
+            futures::stream::iter(output),
         )))
     }
 
-    /// Total memory currently held by this operator, including all
-    /// per-partition heaps.
     fn size(&self) -> usize {
         size_of::<Self>()
             + self.row_converter.size()
-            + self.partition_converter.size()
             + self.scratch_rows.size()
-            + self.heaps.values().map(|h| h.size()).sum::<usize>()
-            + self.heaps.capacity() * (size_of::<OwnedRow>() + size_of::<TopKHeap>())
+            + self.partition_order_converter.size()
+            + self.group_values.size()
+            + self.group_indices.capacity() * size_of::<usize>()
+            + self.group_heaps.capacity() * size_of::<PartitionedGroupHeap>()
+            + self
+                .group_heaps
+                .iter()
+                .map(PartitionedGroupHeap::allocated_size)
+                .sum::<usize>()
+            + self.shared_batches.capacity() * size_of::<RecordBatch>()
+            + self
+                .shared_batches
+                .iter()
+                .map(get_record_batch_memory_size)
+                .sum::<usize>()
+            + self.shared_batch_uses.capacity() * size_of::<usize>()
+            + self.heap_owned_bytes
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PartitionedGroupHeapEntry {
+    row: Vec<u8>,
+    batch_idx: u32,
+    row_idx: usize,
+}
+
+impl Ord for PartitionedGroupHeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.row.cmp(&other.row)
+    }
+}
+
+impl PartialOrd for PartitionedGroupHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+struct PartitionedGroupHeap {
+    inner: BinaryHeap<PartitionedGroupHeapEntry>,
+    k: usize,
+}
+
+impl PartitionedGroupHeap {
+    fn new(k: usize) -> Self {
+        Self {
+            inner: BinaryHeap::new(),
+            k,
+        }
+    }
+
+    fn max(&self) -> Option<&PartitionedGroupHeapEntry> {
+        (self.inner.len() == self.k)
+            .then(|| self.inner.peek().expect("full heap has a boundary"))
+    }
+
+    /// Insert a row, reusing the evicted entry's key allocation when full.
+    /// Returns the increase in encoded-key capacity.
+    fn add(&mut self, row: &[u8], batch_idx: u32, row_idx: usize) -> usize {
+        if self.inner.len() == self.k {
+            let mut boundary = self.inner.peek_mut().expect("full heap has a boundary");
+            let old_capacity = boundary.row.capacity();
+            boundary.row.clear();
+            boundary.row.extend_from_slice(row);
+            boundary.batch_idx = batch_idx;
+            boundary.row_idx = row_idx;
+            boundary.row.capacity() - old_capacity
+        } else {
+            let entry = PartitionedGroupHeapEntry {
+                row: row.to_vec(),
+                batch_idx,
+                row_idx,
+            };
+            let capacity = entry.row.capacity();
+            self.inner.push(entry);
+            capacity
+        }
+    }
+
+    fn allocated_size(&self) -> usize {
+        self.inner.capacity() * size_of::<PartitionedGroupHeapEntry>()
     }
 }
 
