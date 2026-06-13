@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use arrow::array::builder::BooleanBufferBuilder;
 use datafusion_common::{Result, assert_eq_or_internal_err};
 use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
 use parquet::file::metadata::RowGroupMetaData;
@@ -267,10 +268,9 @@ impl ParquetAccessPlan {
             let RowGroupAccess::Selection(selection) = rg else {
                 continue;
             };
-            let rows_in_selection = selection
-                .iter()
-                .map(|selection| selection.row_count)
-                .sum::<usize>();
+            // covered rows = selected + skipped; cheap for both the RLE and
+            // the mask backing (no materialisation)
+            let rows_in_selection = selection.row_count() + selection.skipped_row_count();
 
             let row_group_row_count = rg_meta.num_rows();
             assert_eq_or_internal_err!(
@@ -280,6 +280,41 @@ impl ParquetAccessPlan {
                     but selection only specifies {rows_in_selection} rows. \
                     Selection: {selection:?}"
             );
+        }
+
+        // If every Selection is mask-backed, concatenate the masks directly
+        // and keep the overall selection mask-backed. This avoids exploding
+        // dense scattered selections into the RLE form (~16 bytes per run vs
+        // 1 bit per row) and lets the parquet reader take its mask fast path.
+        let all_mask_backed = self.row_groups.iter().all(|rg| match rg {
+            RowGroupAccess::Selection(s) => s.as_mask().is_some(),
+            _ => true,
+        });
+        if all_mask_backed {
+            let total_rows: usize = self
+                .row_groups
+                .iter()
+                .zip(row_group_meta_data.iter())
+                .map(|(rg, rg_meta)| match rg {
+                    RowGroupAccess::Skip => 0,
+                    _ => rg_meta.num_rows() as usize,
+                })
+                .sum();
+            let mut mask = BooleanBufferBuilder::new(total_rows);
+            for (rg, rg_meta) in self.row_groups.iter().zip(row_group_meta_data.iter()) {
+                match rg {
+                    RowGroupAccess::Skip => {}
+                    RowGroupAccess::Scan => {
+                        mask.append_n(rg_meta.num_rows() as usize, true);
+                    }
+                    RowGroupAccess::Selection(selection) => {
+                        // checked by all_mask_backed above
+                        let m = selection.as_mask().expect("mask-backed selection");
+                        mask.append_buffer(m);
+                    }
+                }
+            }
+            return Ok(Some(RowSelection::from_boolean_buffer(mask.finish())));
         }
 
         let total_selection: RowSelection = self
