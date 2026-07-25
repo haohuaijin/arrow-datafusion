@@ -38,6 +38,7 @@ use datafusion_common::DataFusionError;
 use datafusion_common::config::TableParquetOptions;
 use datafusion_datasource::TableSchema;
 use datafusion_datasource::file::FileSource;
+use datafusion_datasource::file_groups::FileGroupPartitioner;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::{EquivalenceProperties, conjunction};
@@ -528,6 +529,52 @@ impl From<ParquetSource> for Arc<dyn FileSource> {
 }
 
 impl FileSource for ParquetSource {
+    /// Repartition the scan with awareness of any [`ParquetAccessPlan`]
+    /// attached to the files: files are split by the row groups their plan
+    /// actually scans, balanced by estimated scan bytes, so skipped row groups
+    /// do not contribute decode work and the scan is spread evenly. Files
+    /// without access plans share the same partition budget using byte-range
+    /// work items; scans containing no access plans fall back to the default
+    /// byte-range repartitioning.
+    ///
+    /// [`ParquetAccessPlan`]: crate::ParquetAccessPlan
+    fn repartitioned(
+        &self,
+        target_partitions: usize,
+        repartition_file_min_size: usize,
+        output_ordering: Option<LexOrdering>,
+        config: &FileScanConfig,
+    ) -> datafusion_common::Result<Option<FileScanConfig>> {
+        if config.file_compression_type.is_compressed() {
+            return Ok(None);
+        }
+
+        if let Some(file_groups) = crate::repartition::repartition_by_access_plan(
+            &config.file_groups,
+            target_partitions,
+            repartition_file_min_size,
+            output_ordering.is_some(),
+        ) {
+            let mut source = config.clone();
+            source.file_groups = file_groups;
+            return Ok(Some(source));
+        }
+
+        // No applicable access-plan-aware strategy: use the default byte-range
+        // partitioner (for example, when no file has an access plan).
+        let repartitioned_file_groups = FileGroupPartitioner::new()
+            .with_target_partitions(target_partitions)
+            .with_repartition_file_min_size(repartition_file_min_size)
+            .with_preserve_order_within_groups(output_ordering.is_some())
+            .repartition_file_groups(&config.file_groups);
+
+        Ok(repartitioned_file_groups.map(|file_groups| {
+            let mut source = config.clone();
+            source.file_groups = file_groups;
+            source
+        }))
+    }
+
     fn create_file_opener(
         &self,
         _object_store: Arc<dyn ObjectStore>,
@@ -1059,6 +1106,46 @@ mod tests {
 
         assert!(source.reverse_row_groups());
         assert!(source.filter().is_some());
+    }
+
+    #[test]
+    fn repartition_min_size_prevents_ordered_generic_fallback() {
+        use crate::ParquetAccessPlan;
+        use datafusion_datasource::PartitionedFile;
+        use datafusion_datasource::file_groups::FileGroup;
+        use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+        use datafusion_execution::object_store::ObjectStoreUrl;
+        use pushdown_sort_helpers::{schema_with_a_int, sort_expr_on};
+
+        let schema = schema_with_a_int();
+        let source = ParquetSource::new(Arc::clone(&schema));
+        let file = |name: &str| {
+            PartitionedFile::new(name.to_string(), 1024)
+                .with_extension(ParquetAccessPlan::new_all(1))
+        };
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::local_filesystem(),
+            Arc::new(source.clone()),
+        )
+        .with_file_groups(vec![
+            FileGroup::new(vec![file("a.parquet")]),
+            FileGroup::new(vec![file("b.parquet")]),
+        ])
+        .build();
+        let ordering = LexOrdering::new(vec![sort_expr_on(&schema, "a", false)]).unwrap();
+
+        let result = source
+            .repartitioned(4, 10 * 1024 * 1024, Some(ordering), &config)
+            .unwrap()
+            .expect("access-plan path handles the min-size decision");
+        assert_eq!(result.file_groups.len(), 2);
+        assert!(
+            result
+                .file_groups
+                .iter()
+                .flat_map(|group| group.iter())
+                .all(|file| file.range.is_none())
+        );
     }
 
     /// Helpers for the `try_pushdown_sort` regression tests below.

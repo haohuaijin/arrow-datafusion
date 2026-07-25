@@ -30,6 +30,7 @@ use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::ParquetSource;
 use datafusion::prelude::SessionContext;
 use datafusion_common::{DFSchema, assert_contains};
+use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource_parquet::{ParquetAccessPlan, RowGroupAccess};
 use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_expr::{Expr, col, lit};
@@ -263,6 +264,69 @@ async fn bad_selection() {
     );
 }
 
+#[tokio::test]
+async fn repartition_preserves_invalid_all_skip_plan_validation() -> Result<()> {
+    let ctx = SessionContext::new();
+    let test_data = get_test_data();
+    let file_name = normalized_file_name(&test_data.file_name);
+
+    // The parquet file has two row groups. The invalid descriptor produces no
+    // rows, while the second descriptor ensures access-aware repartitioning has
+    // active work to distribute.
+    let invalid = PartitionedFile::new(file_name.clone(), test_data.file_size)
+        .with_extension(ParquetAccessPlan::new_none(3));
+    let active = PartitionedFile::new(file_name, test_data.file_size)
+        .with_extension(ParquetAccessPlan::new_all(2));
+    let source = Arc::new(ParquetSource::new(Arc::clone(&test_data.schema)));
+    let config = FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), source)
+        .with_file_group(FileGroup::new(vec![invalid, active]))
+        .build();
+    let config = config
+        .file_source()
+        .repartitioned(4, 0, None, &config)?
+        .expect("access-aware repartition should apply");
+    let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(config);
+
+    let err = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+        .await
+        .unwrap_err();
+    assert_contains!(&err.to_string(), "Invalid ParquetAccessPlan");
+    assert_contains!(&err.to_string(), "Specified 3 row groups, but file has 2");
+    Ok(())
+}
+
+#[tokio::test]
+async fn repartition_preserves_invalid_zero_row_selection_validation() -> Result<()> {
+    let ctx = SessionContext::new();
+    let test_data = get_test_data();
+    let file_name = normalized_file_name(&test_data.file_name);
+
+    let plan = ParquetAccessPlan::new(vec![
+        RowGroupAccess::Scan,
+        // Selects zero rows but covers only four of the five rows in RG 1.
+        RowGroupAccess::Selection(RowSelection::from(vec![RowSelector::skip(4)])),
+    ]);
+    let file = PartitionedFile::new(file_name, test_data.file_size).with_extension(plan);
+    let source = Arc::new(ParquetSource::new(Arc::clone(&test_data.schema)));
+    let config = FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), source)
+        .with_file(file)
+        .build();
+    let config = config
+        .file_source()
+        .repartitioned(2, 0, None, &config)?
+        .expect("access-aware repartition should apply");
+    let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(config);
+
+    let err = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+        .await
+        .unwrap_err();
+    assert_contains!(
+        &err.to_string(),
+        "Row group 1 has 5 rows but selection only specifies 4 rows"
+    );
+    Ok(())
+}
+
 /// Return a RowSelection of 1 rows from a row group of 5 rows
 fn select_one_row() -> RowSelection {
     RowSelection::from(vec![
@@ -338,12 +402,7 @@ impl TestFull {
             ref file_size,
         } = get_test_data();
 
-        let new_file_name = if cfg!(target_os = "windows") {
-            // Windows path separator is different from Unix
-            file_name.replace("\\", "/")
-        } else {
-            file_name.clone()
-        };
+        let new_file_name = normalized_file_name(file_name);
 
         let mut partitioned_file = PartitionedFile::new(new_file_name, *file_size);
 
@@ -395,6 +454,15 @@ struct TestData {
     schema: SchemaRef,
     file_name: String,
     file_size: u64,
+}
+
+fn normalized_file_name(file_name: &str) -> String {
+    if cfg!(target_os = "windows") {
+        // Windows path separator is different from Unix
+        file_name.replace("\\", "/")
+    } else {
+        file_name.to_string()
+    }
 }
 
 /// Return a parquet file with 2 row groups each with 5 rows

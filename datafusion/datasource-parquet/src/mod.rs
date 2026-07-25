@@ -33,6 +33,7 @@ mod opener;
 mod page_filter;
 mod push_decoder;
 mod reader;
+mod repartition;
 mod row_filter;
 mod row_group_filter;
 mod schema_coercion;
