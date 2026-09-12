@@ -1,0 +1,150 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Exact Parquet extrema prove that a + 1 cannot overflow. The ordering
+# declaration is independently required; statistics alone do not imply order.
+statement ok
+SET datafusion.execution.target_partitions = 1;
+
+statement ok
+SET datafusion.execution.collect_statistics = true;
+
+statement ok
+COPY (SELECT * FROM (VALUES (1), (2), (3)) AS t(a) ORDER BY a)
+TO 'test_files/scratch/statistics_ordering/safe.parquet' STORED AS PARQUET;
+
+statement ok
+CREATE EXTERNAL TABLE stats_ordered STORED AS PARQUET WITH ORDER (a ASC)
+LOCATION 'test_files/scratch/statistics_ordering/safe.parquet';
+
+query I
+SELECT a + 1 AS x FROM stats_ordered ORDER BY x;
+----
+2
+3
+4
+
+query TT
+EXPLAIN SELECT a + 1 AS x FROM stats_ordered ORDER BY x;
+----
+logical_plan
+01)Sort: x ASC NULLS LAST
+02)--Projection: stats_ordered.a + Int64(1) AS x
+03)----TableScan: stats_ordered projection=[a]
+physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/statistics_ordering/safe.parquet]]}, projection=[a@0 + 1 as x], file_type=parquet
+
+# The same extrema do not establish ordering on an unordered input.
+statement ok
+COPY (SELECT * FROM (VALUES (3), (1), (2)) AS t(a))
+TO 'test_files/scratch/statistics_ordering/unsorted.parquet' STORED AS PARQUET;
+
+statement ok
+CREATE EXTERNAL TABLE stats_unordered STORED AS PARQUET
+LOCATION 'test_files/scratch/statistics_ordering/unsorted.parquet';
+
+query TT
+EXPLAIN SELECT a + 1 AS x FROM stats_unordered ORDER BY x;
+----
+logical_plan
+01)Sort: x ASC NULLS LAST
+02)--Projection: stats_unordered.a + Int64(1) AS x
+03)----TableScan: stats_unordered projection=[a]
+physical_plan
+01)SortExec: expr=[x@0 ASC NULLS LAST], preserve_partitioning=[false]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/statistics_ordering/unsorted.parquet]]}, projection=[a@0 + 1 as x], file_type=parquet
+
+# Wrapping at the Int32 boundary requires a sort.
+statement ok
+COPY (SELECT * FROM (VALUES (2147483646::INT), (2147483647::INT)) AS t(a) ORDER BY a)
+TO 'test_files/scratch/statistics_ordering/overflow.parquet' STORED AS PARQUET;
+
+statement ok
+CREATE EXTERNAL TABLE stats_overflow STORED AS PARQUET WITH ORDER (a ASC)
+LOCATION 'test_files/scratch/statistics_ordering/overflow.parquet';
+
+query I
+SELECT a + 1::INT AS x FROM stats_overflow ORDER BY x;
+----
+-2147483648
+2147483647
+
+query TT
+EXPLAIN SELECT a + 1::INT AS x FROM stats_overflow ORDER BY x;
+----
+logical_plan
+01)Sort: x ASC NULLS LAST
+02)--Projection: stats_overflow.a + Int32(1) AS x
+03)----TableScan: stats_overflow projection=[a]
+physical_plan
+01)SortExec: expr=[x@0 ASC NULLS LAST], preserve_partitioning=[false]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/statistics_ordering/overflow.parquet]]}, projection=[a@0 + 1 as x], file_type=parquet
+
+# Pushed filters downgrade statistics to Inexact, which cannot prove ordering.
+query TT
+EXPLAIN SELECT a + 1 AS x FROM stats_ordered WHERE a > 1 ORDER BY x;
+----
+logical_plan
+01)Sort: x ASC NULLS LAST
+02)--Projection: stats_ordered.a + Int64(1) AS x
+03)----Filter: stats_ordered.a > Int64(1)
+04)------TableScan: stats_ordered projection=[a], partial_filters=[stats_ordered.a > Int64(1)]
+physical_plan
+01)SortExec: expr=[x@0 ASC NULLS LAST], preserve_partitioning=[false]
+02)--ProjectionExec: expr=[a@0 + 1 as x]
+03)----FilterExec: a@0 > 1
+04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/statistics_ordering/safe.parquet]]}, projection=[a], output_ordering=[a@0 ASC NULLS LAST], file_type=parquet, predicate=a@0 > 1, pruning_predicate=a_null_count@1 != row_count@2 AND a_max@0 > 1, required_guarantees=[]
+
+query I
+SELECT a - 1 AS x FROM stats_ordered ORDER BY x;
+----
+0
+1
+2
+
+query TT
+EXPLAIN SELECT a - 1 AS x FROM stats_ordered ORDER BY x;
+----
+logical_plan
+01)Sort: x ASC NULLS LAST
+02)--Projection: stats_ordered.a - Int64(1) AS x
+03)----TableScan: stats_ordered projection=[a]
+physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/statistics_ordering/safe.parquet]]}, projection=[a@0 - 1 as x], file_type=parquet
+
+# Disable statistics collection before registering a fresh table.
+statement ok
+SET datafusion.execution.collect_statistics = false;
+
+statement ok
+CREATE EXTERNAL TABLE stats_missing STORED AS PARQUET WITH ORDER (a ASC)
+LOCATION 'test_files/scratch/statistics_ordering/safe.parquet';
+
+query TT
+EXPLAIN SELECT a + 1 AS x FROM stats_missing ORDER BY x;
+----
+logical_plan
+01)Sort: x ASC NULLS LAST
+02)--Projection: stats_missing.a + Int64(1) AS x
+03)----TableScan: stats_missing projection=[a]
+physical_plan
+01)SortExec: expr=[x@0 ASC NULLS LAST], preserve_partitioning=[false]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/statistics_ordering/safe.parquet]]}, projection=[a@0 + 1 as x], file_type=parquet
+
+statement ok
+SET datafusion.execution.collect_statistics = true;
+
+statement ok
+SET datafusion.execution.target_partitions = 4;

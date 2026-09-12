@@ -33,15 +33,19 @@ use self::dependency::{
 use crate::equivalence::{
     AcrossPartitions, EquivalenceGroup, OrderingEquivalenceClass, ProjectionMapping,
 };
-use crate::expressions::{Column, Literal, with_new_schema};
+use crate::expressions::{BinaryExpr, Column, Literal, with_new_schema};
 use crate::{
     ConstExpr, LexOrdering, LexRequirement, PhysicalExpr, PhysicalSortExpr,
     PhysicalSortRequirement,
 };
 
 use arrow::datatypes::SchemaRef;
+use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion_common::{Constraint, Constraints, HashMap, Result, plan_err};
+use datafusion_common::{
+    ColumnStatistics, Constraint, Constraints, HashMap, Result, ScalarValue, plan_err,
+};
+use datafusion_expr::Operator;
 use datafusion_expr::interval_arithmetic::Interval;
 use datafusion_expr::sort_properties::{ExprProperties, SortProperties};
 use datafusion_physical_expr_common::sort_expr::options_compatible;
@@ -241,7 +245,7 @@ impl EquivalenceProperties {
             return None;
         }
         let dependencies = Dependencies::new(std::iter::once(sort_expr.clone()));
-        let properties = get_expr_properties(&r_expr, &dependencies, schema).ok()?;
+        let properties = get_expr_properties(&r_expr, &dependencies, schema, &[]).ok()?;
         (properties.strictly_order_preserving
             && properties.sort_properties == SortProperties::Ordered(sort_expr.options))
         .then(|| PhysicalSortExpr::new(r_expr, sort_expr.options))
@@ -1114,6 +1118,7 @@ impl EquivalenceProperties {
         &self,
         mapping: &ProjectionMapping,
         mut oeq_class: OrderingEquivalenceClass,
+        column_ranges: &[Option<Interval>],
     ) -> Vec<LexOrdering> {
         // Normalize source expressions in the mapping:
         let mapping = self.normalize_mapping(mapping);
@@ -1124,7 +1129,14 @@ impl EquivalenceProperties {
             referred_dependencies(&dependency_map, source)
                 .into_iter()
                 .filter_map(|deps| {
-                    let ep = get_expr_properties(source, &deps, &self.schema);
+                    // Initially use statistical bounds only for integer addition and
+                    // subtraction. Other expressions retain their existing inference.
+                    let ranges = if supports_statistical_ordering(source, &self.schema) {
+                        column_ranges
+                    } else {
+                        &[]
+                    };
+                    let ep = get_expr_properties(source, &deps, &self.schema, ranges);
                     let sort_properties = ep.map(|prop| prop.sort_properties);
                     if let Ok(SortProperties::Ordered(options)) = sort_properties {
                         Some((options, deps))
@@ -1237,7 +1249,58 @@ impl EquivalenceProperties {
         // Built here, so it satisfies the precondition by construction; going
         // through the checked entry point would reproject it under
         // `debug_assertions` for nothing.
-        self.project_with_eq_group_unchecked(mapping, output_schema, eq_group)
+        self.project_with_eq_group_unchecked(mapping, output_schema, eq_group, &[])
+    }
+
+    /// Projects orderings using exact input column extrema to prove that integer
+    /// addition and subtraction cannot overflow. Statistics must describe the
+    /// entire input, across all partitions, using this property's schema.
+    /// Estimates, NULL extrema and type mismatches do not provide bounds.
+    /// Bounds are consumed here, never stored in the output equivalence properties.
+    pub fn project_with_statistics(
+        &self,
+        mapping: &ProjectionMapping,
+        output_schema: SchemaRef,
+        statistics: &[ColumnStatistics],
+    ) -> Self {
+        let column_ranges = self
+            .schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                let data_type = field.data_type();
+                if !data_type.is_integer() {
+                    return None;
+                }
+                let stats = statistics.get(index)?;
+                let bound = |value: &Precision<ScalarValue>| match value {
+                    Precision::Exact(value)
+                        if !value.is_null() && value.data_type() == *data_type =>
+                    {
+                        Some(value.clone())
+                    }
+                    _ => None,
+                };
+                let lower = bound(&stats.min_value);
+                let upper = bound(&stats.max_value);
+                if lower.is_none() && upper.is_none() {
+                    return None;
+                }
+                let unbounded = ScalarValue::try_from(data_type).ok()?;
+                Interval::try_new(
+                    lower.unwrap_or_else(|| unbounded.clone()),
+                    upper.unwrap_or(unbounded),
+                )
+                .ok()
+            })
+            .collect::<Vec<_>>();
+        self.project_with_eq_group_unchecked(
+            mapping,
+            output_schema,
+            self.eq_group.project(mapping),
+            &column_ranges,
+        )
     }
 
     /// Projects `self`, reusing `cached`'s already-projected equivalence group
@@ -1267,7 +1330,7 @@ impl EquivalenceProperties {
         } else {
             self.eq_group.project(mapping)
         };
-        self.project_with_eq_group_unchecked(mapping, output_schema, eq_group)
+        self.project_with_eq_group_unchecked(mapping, output_schema, eq_group, &[])
     }
 
     fn project_with_eq_group_unchecked(
@@ -1275,9 +1338,13 @@ impl EquivalenceProperties {
         mapping: &ProjectionMapping,
         output_schema: SchemaRef,
         eq_group: EquivalenceGroup,
+        column_ranges: &[Option<Interval>],
     ) -> Self {
-        let orderings =
-            self.projected_orderings(mapping, self.oeq_cache.normal_cls.clone());
+        let orderings = self.projected_orderings(
+            mapping,
+            self.oeq_cache.normal_cls.clone(),
+            column_ranges,
+        );
         let normal_orderings = orderings
             .iter()
             .cloned()
@@ -1603,7 +1670,15 @@ fn get_expr_properties(
     expr: &Arc<dyn PhysicalExpr>,
     dependencies: &Dependencies,
     schema: &SchemaRef,
+    column_ranges: &[Option<Interval>],
 ) -> Result<ExprProperties> {
+    let column_range = || {
+        expr.downcast_ref::<Column>()
+            .and_then(|column| column_ranges.get(column.index()))
+            .and_then(Clone::clone)
+            .map(Ok)
+            .unwrap_or_else(|| Interval::make_unbounded(&expr.data_type(schema)?))
+    };
     if let Some(column_order) = dependencies.iter().find(|&order| expr.eq(&order.expr)) {
         // If exact match is found, return its ordering. This is a base case
         // of the recursion: the expression is treated as an atomic ordered
@@ -1615,14 +1690,14 @@ fn get_expr_properties(
         // sort key, so their strictness only has to be relative to it.
         Ok(ExprProperties {
             sort_properties: SortProperties::Ordered(column_order.options),
-            range: Interval::make_unbounded(&expr.data_type(schema)?)?,
+            range: column_range()?,
             preserves_lex_ordering: false,
             strictly_order_preserving: true,
         })
     } else if expr.downcast_ref::<Column>().is_some() {
         Ok(ExprProperties {
             sort_properties: SortProperties::Unordered,
-            range: Interval::make_unbounded(&expr.data_type(schema)?)?,
+            range: column_range()?,
             preserves_lex_ordering: false,
             // A base case of the recursion: a column is the identity mapping
             // of itself, which is trivially one-to-one.
@@ -1641,11 +1716,28 @@ fn get_expr_properties(
         let child_states = expr
             .children()
             .iter()
-            .map(|child| get_expr_properties(child, dependencies, schema))
+            .map(|child| get_expr_properties(child, dependencies, schema, column_ranges))
             .collect::<Result<Vec<_>>>()?;
         // Calculate expression ordering using ordering of its children.
         expr.get_properties(&child_states)
     }
+}
+
+/// Restrict the new range-aware path to expressions with audited integer semantics.
+fn supports_statistical_ordering(
+    expr: &Arc<dyn PhysicalExpr>,
+    schema: &SchemaRef,
+) -> bool {
+    if !expr.data_type(schema).is_ok_and(|dt| dt.is_integer()) {
+        return false;
+    }
+    expr.downcast_ref::<Column>().is_some()
+        || expr.downcast_ref::<Literal>().is_some()
+        || expr.downcast_ref::<BinaryExpr>().is_some_and(|binary| {
+            matches!(binary.op(), Operator::Plus | Operator::Minus)
+                && supports_statistical_ordering(binary.left(), schema)
+                && supports_statistical_ordering(binary.right(), schema)
+        })
 }
 
 #[cfg(test)]

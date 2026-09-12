@@ -33,7 +33,7 @@ use crate::filter_pushdown::{
     FilterPushdownPropagation, FilterRemapper, PushedDownPredicate,
 };
 use crate::joins::utils::{ColumnIndex, JoinFilter, JoinOn, JoinOnRef};
-use crate::statistics::{ChildStats, StatisticsArgs};
+use crate::statistics::{ChildStats, StatisticsArgs, StatisticsContext};
 use crate::{
     ChildrenPropertiesMode, DisplayFormatType, ExecutionPlan, PhysicalExpr,
     ReplaceChildrenOptions, validate_child_count,
@@ -51,9 +51,10 @@ use datafusion_common::tree_node::{
 };
 use datafusion_common::{DataFusionError, JoinSide, Result, internal_err, plan_err};
 use datafusion_execution::TaskContext;
-use datafusion_expr::ExpressionPlacement;
+use datafusion_expr::{ExpressionPlacement, Operator};
 use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_expr::equivalence::ProjectionMapping;
+use datafusion_physical_expr::expressions::BinaryExpr;
 use datafusion_physical_expr::projection::Projector;
 use datafusion_physical_expr_common::physical_expr::{PhysicalExprRef, fmt_sql};
 use datafusion_physical_expr_common::sort_expr::{
@@ -256,14 +257,42 @@ impl ProjectionExec {
         // handed back is the only thing reuse changes; everything below is
         // common, so the two paths cannot drift apart.
         let input_eq_properties = input.equivalence_properties();
-        let eq_properties = match reuse_from {
-            Some((previous, cached)) => input_eq_properties.project_reusing(
+        // Extrema are queried across all partitions. A fresh context prevents
+        // cached statistics from surviving a plan rewrite. Failure to obtain
+        // optional optimizer metadata must not prevent query planning.
+        let statistics = (!input_eq_properties.oeq_class().is_empty()
+            && projection_mapping
+                .iter()
+                .any(|(expr, _)| uses_statistical_ordering(expr)))
+        .then(|| StatisticsContext::new().compute(input.as_ref(), &StatisticsArgs::new()))
+        .and_then(Result::ok);
+        let eq_properties = if let Some(statistics) =
+            statistics.as_ref().filter(|stats| {
+                stats.column_statistics.iter().any(|column| {
+                    matches!(
+                        column.min_value,
+                        datafusion_common::stats::Precision::Exact(_)
+                    ) || matches!(
+                        column.max_value,
+                        datafusion_common::stats::Precision::Exact(_)
+                    )
+                })
+            }) {
+            input_eq_properties.project_with_statistics(
                 projection_mapping,
                 schema,
-                previous,
-                cached,
-            ),
-            None => input_eq_properties.project(projection_mapping, schema),
+                &statistics.column_statistics,
+            )
+        } else {
+            match reuse_from {
+                Some((previous, cached)) => input_eq_properties.project_reusing(
+                    projection_mapping,
+                    schema,
+                    previous,
+                    cached,
+                ),
+                None => input_eq_properties.project(projection_mapping, schema),
+            }
         };
         // Calculate output partitioning, which needs to respect aliases:
         let output_partitioning = input
@@ -327,6 +356,13 @@ impl ProjectionExec {
         }
         Ok(alias_map)
     }
+}
+
+// Avoid computing input statistics for simple column/alias projections and
+// expressions outside the currently supported range-aware arithmetic path.
+fn uses_statistical_ordering(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    expr.downcast_ref::<BinaryExpr>()
+        .is_some_and(|expr| matches!(expr.op(), Operator::Plus | Operator::Minus))
 }
 
 impl DisplayAs for ProjectionExec {
@@ -421,15 +457,24 @@ impl ExecutionPlan for ProjectionExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         validate_child_count!(self, children);
         match options.children_properties {
-            ChildrenPropertiesMode::Keep => Ok(Arc::new(Self {
-                input: children.swap_remove(0),
-                metrics: ExecutionPlanMetricsSet::new(),
-                ..Self::clone(&*self)
-            })),
-            ChildrenPropertiesMode::Recompute => {
-                // `Keep` above requires the child's properties to be unchanged
-                // outright. A rule that introduces a sort below this projection
-                // does not qualify, yet the child's *equivalence group* is still
+            ChildrenPropertiesMode::Keep
+                if !self
+                    .expr()
+                    .iter()
+                    .any(|expr| uses_statistical_ordering(&expr.expr)) =>
+            {
+                Ok(Arc::new(Self {
+                    input: children.swap_remove(0),
+                    metrics: ExecutionPlanMetricsSet::new(),
+                    ..Self::clone(&*self)
+                }))
+            }
+            // Identical PlanProperties do not imply identical statistics.
+            // Re-derive ordering even for Keep, since a new input may have wider
+            // bounds that invalidate a previously proven overflow-free expression.
+            ChildrenPropertiesMode::Keep | ChildrenPropertiesMode::Recompute => {
+                // A rule that introduces a sort below this projection may
+                // leave the child's *equivalence group*
                 // identical: sorting changes which orderings hold, not which
                 // expressions are equal to one another. Projecting that group
                 // again would reproduce the group already cached here, so reuse
@@ -2087,6 +2132,73 @@ mod tests {
         )
         // expect this to succeed
         .unwrap();
+    }
+
+    #[test]
+    fn test_projection_ordering_from_exact_statistics() -> Result<()> {
+        use crate::sorts::sort::SortExec;
+        use datafusion_common::stats::Precision;
+
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let make_input = |min_value, max_value| -> Arc<dyn ExecutionPlan> {
+            let mut stats = Statistics::new_unknown(&schema);
+            stats.column_statistics[0].min_value = min_value;
+            stats.column_statistics[0].max_value = max_value;
+            let input = Arc::new(StatisticsExec::new(stats, schema.clone()));
+            Arc::new(SortExec::new(
+                LexOrdering::new([PhysicalSortExpr::new_default(Arc::new(Column::new(
+                    "a", 0,
+                )))])
+                .unwrap(),
+                input,
+            ))
+        };
+        let exact = |n| Precision::Exact(ScalarValue::Int32(Some(n)));
+        let expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("a", 0)),
+            Operator::Plus,
+            lit(1i32),
+        ));
+        for (min, max, ordered) in [
+            (exact(1), exact(3), true),
+            (exact(1), exact(i32::MAX), false),
+            (Precision::Absent, Precision::Absent, false),
+            (exact(1), Precision::Absent, false),
+            (
+                Precision::Inexact(ScalarValue::Int32(Some(1))),
+                Precision::Inexact(ScalarValue::Int32(Some(3))),
+                false,
+            ),
+            (Precision::Exact(ScalarValue::Int32(None)), exact(3), false),
+            (
+                Precision::Exact(ScalarValue::Utf8(Some("1".into()))),
+                exact(3),
+                false,
+            ),
+        ] {
+            let projection = ProjectionExec::try_new(
+                vec![(Arc::clone(&expr), "x".to_string())],
+                make_input(min, max),
+            )?;
+            assert_eq!(projection.properties().output_ordering().is_some(), ordered);
+        }
+
+        // Keep only promises unchanged PlanProperties, not unchanged extrema.
+        let input = make_input(exact(1), exact(3));
+        let wider_input = make_input(exact(1), exact(i32::MAX));
+        assert_eq!(input.output_ordering(), wider_input.output_ordering());
+        assert_eq!(input.schema(), wider_input.schema());
+        let projection = Arc::new(ProjectionExec::try_new(
+            vec![(expr, "x".to_string())],
+            input,
+        )?);
+        assert!(projection.properties().output_ordering().is_some());
+        let replaced = projection.replace_children(
+            vec![wider_input],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Keep),
+        )?;
+        assert!(replaced.output_ordering().is_none());
+        Ok(())
     }
 
     #[test]

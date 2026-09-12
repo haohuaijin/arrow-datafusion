@@ -122,6 +122,32 @@ impl BinaryExpr {
         &self.op
     }
 
+    /// Interval arithmetic uses mathematical overflow bounds, which do not
+    /// cover wrapped execution values. Discard those bounds before a parent
+    /// expression or projection can rely on them.
+    fn arithmetic_range(
+        &self,
+        lhs: &Interval,
+        rhs: &Interval,
+        range: Interval,
+    ) -> Result<Interval> {
+        let wraps_in_domain = match self.op {
+            Operator::Plus => is_time_plus_interval(&lhs.data_type(), &rhs.data_type()),
+            Operator::Minus => is_time_minus_interval(&lhs.data_type(), &rhs.data_type()),
+            _ => false,
+        };
+        if wraps_in_domain
+            || (!self.fail_on_overflow
+                && range.data_type().is_integer()
+                && (range.is_unbounded()
+                    || unsigned_subtraction_may_underflow(self.op, lhs, rhs, &range)))
+        {
+            Interval::make_unbounded(&range.data_type())
+        } else {
+            Ok(range)
+        }
+    }
+
     /// Wrapping on overflow breaks monotonicity (e.g. the sum of two
     /// ascending `UInt8` columns can wrap back to small values), so the
     /// derived ordering is kept only when overflow is impossible. `time ±
@@ -832,7 +858,8 @@ impl PhysicalExpr for BinaryExpr {
         let (r_order, r_range) = (children[1].sort_properties, &children[1].range);
         match self.op() {
             Operator::Plus => {
-                let range = l_range.add(r_range)?;
+                let range =
+                    self.arithmetic_range(l_range, r_range, l_range.add(r_range)?)?;
                 Ok(ExprProperties {
                     sort_properties: self.arithmetic_sort_properties(
                         l_order.add(&r_order),
@@ -846,7 +873,8 @@ impl PhysicalExpr for BinaryExpr {
                 })
             }
             Operator::Minus => {
-                let range = l_range.sub(r_range)?;
+                let range =
+                    self.arithmetic_range(l_range, r_range, l_range.sub(r_range)?)?;
                 Ok(ExprProperties {
                     sort_properties: self.arithmetic_sort_properties(
                         l_order.sub(&r_order),
@@ -1407,6 +1435,57 @@ mod tests {
     use arrow::array::BooleanArray;
     use arrow::compute::SortOptions;
     use datafusion_expr::col as logical_col;
+
+    #[test]
+    fn test_wrapping_arithmetic_ranges_cover_results() -> Result<()> {
+        // Exercise unsigned underflow and both directions of signed overflow.
+        for (op, lower, upper, rhs) in [
+            (
+                Operator::Plus,
+                ScalarValue::Int8(Some(120)),
+                ScalarValue::Int8(Some(127)),
+                ScalarValue::Int8(Some(10)),
+            ),
+            (
+                Operator::Minus,
+                ScalarValue::Int8(Some(-128)),
+                ScalarValue::Int8(Some(-120)),
+                ScalarValue::Int8(Some(10)),
+            ),
+            (
+                Operator::Minus,
+                ScalarValue::UInt8(Some(0)),
+                ScalarValue::UInt8(Some(10)),
+                ScalarValue::UInt8(Some(5)),
+            ),
+        ] {
+            let data_type = lower.data_type();
+            let schema =
+                Arc::new(Schema::new(vec![Field::new("a", data_type.clone(), true)]));
+            let expr = BinaryExpr::new(
+                col("a", &schema)?,
+                op,
+                Arc::new(Literal::new(rhs.clone())),
+            );
+            let input_range = Interval::try_new(lower.clone(), upper.clone())?;
+            let props = expr.get_properties(&[
+                ExprProperties::new_unknown().with_range(input_range),
+                ExprProperties::new_unknown().with_range(Interval::from(rhs)),
+            ])?;
+            assert_eq!(props.range, Interval::make_unbounded(&data_type)?);
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![ScalarValue::iter_to_array([lower, upper])?],
+            )?;
+            let values = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
+            for row in 0..values.len() {
+                let value = ScalarValue::try_from_array(&values, row)?;
+                assert!(props.range.lower().is_null() || props.range.lower() <= &value);
+                assert!(props.range.upper().is_null() || &value <= props.range.upper());
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_arithmetic_ordering_overflow() -> Result<()> {
