@@ -6406,7 +6406,7 @@ mod tests {
     }
 
     #[test]
-    fn test_integer_interval_propagation_covers_runtime_values() -> Result<()> {
+    fn test_integer_interval_propagation_covers_runtime_values() {
         // Enumerate small domains and both ends of Int8, including zero divisors,
         // truncation, signed overflow and checked arithmetic. Every successful
         // runtime evaluation must remain possible after interval propagation.
@@ -6431,9 +6431,9 @@ mod tests {
                     for (rlo, rhi) in
                         domains.into_iter().chain([(-1, -1), (0, 0), (2, 2)])
                     {
-                        let left = Interval::make(Some(lo), Some(hi))?;
-                        let right = Interval::make(Some(rlo), Some(rhi))?;
-                        let bounds = expr.evaluate_bounds(&[&left, &right])?;
+                        let left = Interval::make(Some(lo), Some(hi)).unwrap();
+                        let right = Interval::make(Some(rlo), Some(rhi)).unwrap();
+                        let bounds = expr.evaluate_bounds(&[&left, &right]).unwrap();
                         if matches!(op, Operator::Plus | Operator::Minus) {
                             let children = [left.clone(), right.clone()].map(|range| {
                                 ExprProperties {
@@ -6441,7 +6441,10 @@ mod tests {
                                     ..ExprProperties::new_unknown()
                                 }
                             });
-                            assert_eq!(expr.get_properties(&children)?.range, bounds);
+                            assert_eq!(
+                                expr.get_properties(&children).unwrap().range,
+                                bounds
+                            );
                         }
                         for a in lo..=hi {
                             for b in rlo..=rhi {
@@ -6460,30 +6463,34 @@ mod tests {
                                 let Some(result) = result else {
                                     continue;
                                 };
-                                let result = Interval::make(Some(result), Some(result))?;
+                                let result =
+                                    Interval::make(Some(result), Some(result)).unwrap();
                                 assert_eq!(
-                                    bounds.contains(&result)?,
+                                    bounds.contains(&result).unwrap(),
                                     Interval::TRUE,
                                     "forward {a} {op} {b}, checked={checked}, bounds={bounds:?}"
                                 );
                                 let propagated = expr
-                                    .propagate_constraints(&result, &[&left, &right])?;
+                                    .propagate_constraints(&result, &[&left, &right])
+                                    .unwrap();
                                 let propagated = propagated
                                     .expect("successful runtime result must be feasible");
                                 if !propagated.is_empty() {
                                     assert_eq!(
-                                        propagated[0].contains(&Interval::make(
-                                            Some(a),
-                                            Some(a)
-                                        )?)?,
+                                        propagated[0]
+                                            .contains(
+                                                Interval::make(Some(a), Some(a)).unwrap()
+                                            )
+                                            .unwrap(),
                                         Interval::TRUE,
                                         "left input excluded for {a} {op} {b}, checked={checked}: {propagated:?}"
                                     );
                                     assert_eq!(
-                                        propagated[1].contains(&Interval::make(
-                                            Some(b),
-                                            Some(b)
-                                        )?)?,
+                                        propagated[1]
+                                            .contains(
+                                                Interval::make(Some(b), Some(b)).unwrap()
+                                            )
+                                            .unwrap(),
                                         Interval::TRUE,
                                         "right input excluded for {a} {op} {b}, checked={checked}: {propagated:?}"
                                     );
@@ -6494,83 +6501,90 @@ mod tests {
                 }
             }
         }
-        Ok(())
     }
 
     #[test]
-    fn test_unsigned_subtraction_interval_underflow() -> Result<()> {
+    fn test_unsigned_subtraction_interval_underflow() {
         let expr = BinaryExpr::new(lit(0u8), Operator::Minus, lit(1u8));
-        let left = Interval::make(Some(0u8), Some(2u8))?;
-        let right = Interval::make(Some(1u8), Some(1u8))?;
-        let wrapped = Interval::make(Some(255u8), Some(255u8))?;
+        let left = Interval::make(Some(0u8), Some(2u8)).unwrap();
+        let right = Interval::make(Some(1u8), Some(1u8)).unwrap();
+        let wrapped = Interval::make(Some(255u8), Some(255u8)).unwrap();
         assert_eq!(
-            expr.evaluate_bounds(&[&left, &right])?.contains(&wrapped)?,
+            expr.evaluate_bounds(&[&left, &right])
+                .unwrap()
+                .contains(&wrapped)
+                .unwrap(),
             Interval::TRUE
         );
         assert_eq!(
-            expr.propagate_constraints(&wrapped, &[&left, &right])?,
+            expr.propagate_constraints(&wrapped, &[&left, &right])
+                .unwrap(),
             Some(vec![])
         );
-        Ok(())
     }
 
     #[test]
-    fn test_nested_wrapping_arithmetic_properties() -> Result<()> {
+    fn test_nested_wrapping_arithmetic_properties() {
         let difference = Arc::new(BinaryExpr::new(lit(0u8), Operator::Minus, lit(1u8)));
         let singleton = |value: u8| ExprProperties {
             sort_properties: SortProperties::Singleton,
             range: Interval::make(Some(value), Some(value)).unwrap(),
             ..ExprProperties::new_unknown()
         };
-        let difference_props =
-            difference.get_properties(&[singleton(0), singleton(1)])?;
+        let difference_props = difference
+            .get_properties(&[singleton(0), singleton(1)])
+            .unwrap();
         assert_eq!(difference_props.sort_properties, SortProperties::Singleton);
         assert!(
             difference_props
                 .range
-                .contains_value(ScalarValue::UInt8(Some(255)))?
+                .contains_value(ScalarValue::UInt8(Some(255)))
+                .unwrap()
         );
 
         // The inner constant wraps to 255. An incorrect range of [0, 0]
         // would let the outer addition claim to preserve ascending order.
         let expr =
             BinaryExpr::new(Arc::new(Column::new("a", 0)), Operator::Plus, difference);
-        let properties = expr.get_properties(&[
-            ExprProperties {
-                sort_properties: SortProperties::Ordered(SortOptions::default()),
-                range: Interval::make(Some(0u8), Some(1u8))?,
-                ..ExprProperties::new_unknown()
-            },
-            difference_props,
-        ])?;
+        let properties = expr
+            .get_properties(&[
+                ExprProperties {
+                    sort_properties: SortProperties::Ordered(SortOptions::default()),
+                    range: Interval::make(Some(0u8), Some(1u8)).unwrap(),
+                    ..ExprProperties::new_unknown()
+                },
+                difference_props,
+            ])
+            .unwrap();
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("a", DataType::UInt8, false)])),
             vec![Arc::new(UInt8Array::from(vec![0, 1]))],
-        )?;
-        let actual = expr.evaluate(&batch)?.into_array(2)?;
+        )
+        .unwrap();
+        let actual = expr.evaluate(&batch).unwrap().into_array(2).unwrap();
         assert_eq!(actual.as_ref(), &UInt8Array::from(vec![255, 0]));
         assert_eq!(properties.sort_properties, SortProperties::Unordered);
         for value in [0u8, 255] {
             assert!(
                 properties
                     .range
-                    .contains_value(ScalarValue::UInt8(Some(value)))?
+                    .contains_value(ScalarValue::UInt8(Some(value)))
+                    .unwrap()
             );
         }
-        Ok(())
     }
 
     #[test]
-    fn test_safe_integer_multiplication_still_propagates() -> Result<()> {
+    fn test_safe_integer_multiplication_still_propagates() {
         let expr = BinaryExpr::new(lit(0i32), Operator::Multiply, lit(2i32));
-        let left = Interval::make(Some(0i32), Some(10i32))?;
-        let right = Interval::make(Some(2i32), Some(2i32))?;
-        let parent = Interval::make(Some(4i32), Some(4i32))?;
+        let left = Interval::make(Some(0i32), Some(10i32)).unwrap();
+        let right = Interval::make(Some(2i32), Some(2i32)).unwrap();
+        let parent = Interval::make(Some(4i32), Some(4i32)).unwrap();
         assert_eq!(
-            expr.propagate_constraints(&parent, &[&left, &right])?,
-            Some(vec![Interval::make(Some(2i32), Some(2i32))?, right])
+            expr.propagate_constraints(&parent, &[&left, &right])
+                .unwrap(),
+            Some(vec![Interval::make(Some(2i32), Some(2i32)).unwrap(), right])
         );
-        Ok(())
     }
 
     #[test]

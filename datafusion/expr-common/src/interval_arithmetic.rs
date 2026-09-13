@@ -437,22 +437,12 @@ impl Interval {
                 | (UInt32, UInt64 | Int64)
         );
         let lower = if widening_integer_cast && self.lower.is_null() {
-            get_extreme_value!(
-                MIN,
-                MIN_DECIMAL128_FOR_EACH_PRECISION,
-                MIN_DECIMAL256_FOR_EACH_PRECISION,
-                &source_type
-            )
+            ScalarValue::min(&source_type).expect("integer types have a minimum")
         } else {
             self.lower.clone()
         };
         let upper = if widening_integer_cast && self.upper.is_null() {
-            get_extreme_value!(
-                MAX,
-                MAX_DECIMAL128_FOR_EACH_PRECISION,
-                MAX_DECIMAL256_FOR_EACH_PRECISION,
-                &source_type
-            )
+            ScalarValue::max(&source_type).expect("integer types have a maximum")
         } else {
             self.upper.clone()
         };
@@ -2393,7 +2383,7 @@ mod tests {
     }
 
     #[test]
-    fn test_widening_integer_cast_bounds() -> Result<()> {
+    fn test_widening_integer_cast_bounds() {
         use DataType::{Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64};
         use arrow::compute::CastOptions;
 
@@ -2413,10 +2403,14 @@ mod tests {
                     continue;
                 }
                 // Every source that can widen fits in Int64.
-                let lower = ScalarValue::Int64(Some(*min as i64)).cast_to(source)?;
-                let upper = ScalarValue::Int64(Some(*max as i64)).cast_to(source)?;
-                let zero = ScalarValue::new_zero(source)?;
-                let unbounded = ScalarValue::try_from(source)?;
+                let lower = ScalarValue::Int64(Some(*min as i64))
+                    .cast_to(source)
+                    .unwrap();
+                let upper = ScalarValue::Int64(Some(*max as i64))
+                    .cast_to(source)
+                    .unwrap();
+                let zero = ScalarValue::new_zero(source).unwrap();
+                let unbounded = ScalarValue::try_from(source).unwrap();
                 for (lo, hi, expected_lo, expected_hi) in [
                     (
                         unbounded.clone(),
@@ -2428,25 +2422,43 @@ mod tests {
                     (unbounded.clone(), zero.clone(), lower.clone(), zero.clone()),
                     (zero.clone(), zero.clone(), zero.clone(), zero.clone()),
                 ] {
-                    let actual = Interval::try_new(lo, hi)?
-                        .cast_to(target, &CastOptions::default())?;
+                    let actual = Interval::try_new(lo, hi)
+                        .unwrap()
+                        .cast_to(target, &CastOptions::default())
+                        .unwrap();
                     let expected = Interval::try_new(
-                        expected_lo.cast_to(target)?,
-                        expected_hi.cast_to(target)?,
-                    )?;
+                        expected_lo.cast_to(target).unwrap(),
+                        expected_hi.cast_to(target).unwrap(),
+                    )
+                    .unwrap();
                     assert_eq!(actual, expected, "{source:?} -> {target:?}");
                 }
             }
         }
         // Same-type and narrowing casts retain their existing unbounded behavior.
-        let unbounded = Interval::make_unbounded(&Int64)?;
+        let unbounded = Interval::make_unbounded(&Int64).unwrap();
         for target in [Int64, Int32] {
             assert_eq!(
-                unbounded.cast_to(&target, &CastOptions::default())?,
-                Interval::make_unbounded(&target)?
+                unbounded.cast_to(&target, &CastOptions::default()).unwrap(),
+                Interval::make_unbounded(&target).unwrap()
             );
         }
-        Ok(())
+    }
+
+    #[test]
+    fn test_integer_interval_cast_overflow() {
+        use arrow::compute::CastOptions;
+
+        let options = CastOptions {
+            safe: false,
+            ..Default::default()
+        };
+        // Check failures at either endpoint, including an upper endpoint that
+        // overflows after the lower endpoint has been successfully cast.
+        for (lower, upper) in [(-129i16, 0i16), (0, 128)] {
+            let interval = Interval::make(Some(lower), Some(upper)).unwrap();
+            assert!(interval.cast_to(&DataType::Int8, &options).is_err());
+        }
     }
 
     #[test]

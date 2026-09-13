@@ -2315,8 +2315,9 @@ mod tests {
         let batch = RecordBatch::try_new(
             input.schema(),
             vec![Arc::new(arrow::array::Int32Array::from(vec![i32::MIN]))],
-        )?;
-        let result = predicate.evaluate(&batch)?.into_array(1)?;
+        )
+        .unwrap();
+        let result = predicate.evaluate(&batch).unwrap().into_array(1).unwrap();
         assert_eq!(
             result.as_ref(),
             &arrow::array::BooleanArray::from(vec![true])
