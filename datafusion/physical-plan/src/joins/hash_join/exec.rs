@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fmt;
 use std::mem::size_of;
 use std::sync::{Arc, OnceLock};
@@ -1825,7 +1825,9 @@ impl ExecutionPlan for HashJoinExec {
         //    (e.g. nested mark joins both producing "mark" columns).
         let (left_preserved, right_preserved) = lr_is_preserved(self.join_type);
 
-        // Build the set of allowed column indices for each side
+        // Map each output position to its input position, accounting for the
+        // join's projection. Looking up child columns by name is ambiguous when
+        // a nested join produces multiple fields with the same name.
         let column_indices: Vec<ColumnIndex> = match self.projection.as_ref() {
             Some(projection) => projection
                 .iter()
@@ -1834,59 +1836,52 @@ impl ExecutionPlan for HashJoinExec {
             None => self.column_indices.clone(),
         };
 
-        let (mut left_allowed, mut right_allowed) = (HashSet::new(), HashSet::new());
-        column_indices
-            .iter()
-            .enumerate()
-            .for_each(|(output_idx, ci)| {
-                match ci.side {
-                    JoinSide::Left => left_allowed.insert(output_idx),
-                    JoinSide::Right => right_allowed.insert(output_idx),
-                    // Mark columns - don't allow pushdown to either side
-                    JoinSide::None => false,
-                };
-            });
+        let (mut left_mapping, mut right_mapping) = (HashMap::new(), HashMap::new());
+        for (output_idx, ci) in column_indices.iter().enumerate() {
+            match ci.side {
+                JoinSide::Left => {
+                    left_mapping.insert(output_idx, ci.index);
+                }
+                JoinSide::Right => {
+                    right_mapping.insert(output_idx, ci.index);
+                }
+                // Mark columns cannot be pushed to either side.
+                JoinSide::None => {}
+            }
+        }
 
-        // For semi joins, filters on output join keys can also be pushed to the
-        // non-output side: every emitted row has an equal key there. This is not
-        // true for anti joins, whose emitted rows have no match.
-        match self.join_type {
-            JoinType::LeftSemi => {
-                let left_key_indices: HashSet<usize> = self
-                    .on
-                    .iter()
-                    .filter_map(|(left_key, _)| {
-                        left_key.downcast_ref::<Column>().map(|c| c.index())
+        // Semi joins also allow filters on output join keys to reach the
+        // non-output side. Map to the paired key's position, which need not
+        // have the same name. Only direct column pairs can be remapped this way.
+        // Anti joins cannot do this: their emitted rows have no matching key.
+        if matches!(self.join_type, JoinType::LeftSemi | JoinType::RightSemi) {
+            let key_mapping: HashMap<usize, usize> = self
+                .on
+                .iter()
+                .filter_map(|(left_key, right_key)| {
+                    let left = left_key.downcast_ref::<Column>()?;
+                    let right = right_key.downcast_ref::<Column>()?;
+                    Some(match self.join_type {
+                        JoinType::LeftSemi => (left.index(), right.index()),
+                        _ => (right.index(), left.index()),
                     })
-                    .collect();
-                for (output_idx, ci) in column_indices.iter().enumerate() {
-                    if ci.side == JoinSide::Left && left_key_indices.contains(&ci.index) {
-                        right_allowed.insert(output_idx);
-                    }
+                })
+                .collect();
+            let other_mapping = match self.join_type {
+                JoinType::LeftSemi => &mut right_mapping,
+                _ => &mut left_mapping,
+            };
+            for (output_idx, ci) in column_indices.iter().enumerate() {
+                if let Some(&input_idx) = key_mapping.get(&ci.index) {
+                    other_mapping.insert(output_idx, input_idx);
                 }
             }
-            JoinType::RightSemi => {
-                let right_key_indices: HashSet<usize> = self
-                    .on
-                    .iter()
-                    .filter_map(|(_, right_key)| {
-                        right_key.downcast_ref::<Column>().map(|c| c.index())
-                    })
-                    .collect();
-                for (output_idx, ci) in column_indices.iter().enumerate() {
-                    if ci.side == JoinSide::Right && right_key_indices.contains(&ci.index)
-                    {
-                        left_allowed.insert(output_idx);
-                    }
-                }
-            }
-            _ => {}
         }
 
         let left_child = if left_preserved {
-            ChildFilterDescription::from_child_with_allowed_indices(
+            ChildFilterDescription::from_child_with_column_mapping(
                 &parent_filters,
-                left_allowed,
+                left_mapping,
                 self.left(),
             )?
         } else {
@@ -1894,9 +1889,9 @@ impl ExecutionPlan for HashJoinExec {
         };
 
         let mut right_child = if right_preserved {
-            ChildFilterDescription::from_child_with_allowed_indices(
+            ChildFilterDescription::from_child_with_column_mapping(
                 &parent_filters,
-                right_allowed,
+                right_mapping,
                 self.right(),
             )?
         } else {

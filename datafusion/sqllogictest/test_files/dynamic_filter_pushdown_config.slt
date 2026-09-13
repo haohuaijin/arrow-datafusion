@@ -904,3 +904,123 @@ SET datafusion.optimizer.enable_dynamic_filter_pushdown = true;
 
 statement ok
 RESET datafusion.execution.parquet.max_row_group_size;
+
+# Regression for https://github.com/apache/datafusion/issues/25244.
+# Keep both a.id and b.id in the nested join output. A dynamic filter on b.id
+# must not be remapped by name to a.id, which has a different value. LEFT JOINs
+# preserve this join tree through logical optimization.
+statement ok
+SET datafusion.execution.target_partitions = 1;
+
+statement ok
+SET datafusion.execution.collect_statistics = true;
+
+statement ok
+SET datafusion.execution.parquet.schema_force_view_types = false;
+
+statement ok
+SET datafusion.optimizer.join_reordering = false;
+
+query I
+COPY (SELECT 'a1' AS id, 'x1' AS ty)
+TO 'test_files/scratch/dynamic_filter_pushdown_config/issue_25244_a.parquet'
+STORED AS PARQUET;
+----
+1
+
+query I
+COPY (SELECT 'x1' AS id)
+TO 'test_files/scratch/dynamic_filter_pushdown_config/issue_25244_b.parquet'
+STORED AS PARQUET;
+----
+1
+
+statement ok
+CREATE EXTERNAL TABLE issue_25244_a
+STORED AS PARQUET
+LOCATION 'test_files/scratch/dynamic_filter_pushdown_config/issue_25244_a.parquet';
+
+statement ok
+CREATE EXTERNAL TABLE issue_25244_b
+STORED AS PARQUET
+LOCATION 'test_files/scratch/dynamic_filter_pushdown_config/issue_25244_b.parquet';
+
+statement ok
+SET datafusion.optimizer.enable_join_dynamic_filter_pushdown = false;
+
+query TTTT
+SELECT s.id AS sid, a.id AS aid, b.id AS bid, c.id AS cid
+FROM issue_25244_b s
+JOIN (
+    (issue_25244_a a LEFT JOIN issue_25244_b b ON a.ty = b.id)
+    LEFT JOIN issue_25244_b c ON b.id = c.id
+)
+ON s.id = b.id;
+----
+x1 a1 x1 x1
+
+statement ok
+SET datafusion.optimizer.enable_join_dynamic_filter_pushdown = true;
+
+query TTTT
+SELECT s.id AS sid, a.id AS aid, b.id AS bid, c.id AS cid
+FROM issue_25244_b s
+JOIN (
+    (issue_25244_a a LEFT JOIN issue_25244_b b ON a.ty = b.id)
+    LEFT JOIN issue_25244_b c ON b.id = c.id
+)
+ON s.id = b.id;
+----
+x1 a1 x1 x1
+
+# Parallel execution inserts RepartitionExec above the nested joins. It must
+# preserve the second id's position when forwarding the dynamic filter.
+statement ok
+SET datafusion.execution.target_partitions = 4;
+
+statement ok
+SET datafusion.optimizer.enable_join_dynamic_filter_pushdown = false;
+
+query TTTT
+SELECT s.id AS sid, a.id AS aid, b.id AS bid, c.id AS cid
+FROM issue_25244_b s
+JOIN (
+    (issue_25244_a a LEFT JOIN issue_25244_b b ON a.ty = b.id)
+    LEFT JOIN issue_25244_b c ON b.id = c.id
+)
+ON s.id = b.id;
+----
+x1 a1 x1 x1
+
+statement ok
+SET datafusion.optimizer.enable_join_dynamic_filter_pushdown = true;
+
+query TTTT
+SELECT s.id AS sid, a.id AS aid, b.id AS bid, c.id AS cid
+FROM issue_25244_b s
+JOIN (
+    (issue_25244_a a LEFT JOIN issue_25244_b b ON a.ty = b.id)
+    LEFT JOIN issue_25244_b c ON b.id = c.id
+)
+ON s.id = b.id;
+----
+x1 a1 x1 x1
+
+statement ok
+DROP TABLE issue_25244_a;
+
+statement ok
+DROP TABLE issue_25244_b;
+
+# The SLT runner uses four target partitions.
+statement ok
+SET datafusion.execution.target_partitions = 4;
+
+statement ok
+RESET datafusion.execution.collect_statistics;
+
+statement ok
+RESET datafusion.execution.parquet.schema_force_view_types;
+
+statement ok
+RESET datafusion.optimizer.join_reordering;
