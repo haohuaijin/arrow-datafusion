@@ -1513,7 +1513,7 @@ mod tests {
     }
 
     #[test]
-    fn test_int32_date32_cast_preserves_values_and_ordering() -> Result<()> {
+    fn test_int32_date32_cast_preserves_values_and_ordering() {
         use arrow::array::Date32Array;
         use arrow::compute::SortOptions;
         use datafusion_expr_common::sort_properties::SortProperties;
@@ -1530,23 +1530,35 @@ mod tests {
                 input.data_type().clone(),
                 true,
             )]));
-            let expr =
-                CastExpr::new(col("a", &schema)?, expected.data_type().clone(), None);
+            let expr = CastExpr::new(
+                col("a", &schema).expect("column exists"),
+                expected.data_type().clone(),
+                None,
+            );
             assert!(expr.is_bigger_cast(input.data_type()));
             let child = ExprProperties::new_unknown()
-                .with_range(Interval::make_unbounded(input.data_type())?)
+                .with_range(
+                    Interval::make_unbounded(input.data_type())
+                        .expect("supported interval type"),
+                )
                 .with_order(SortProperties::Ordered(SortOptions::default()))
                 .with_strictly_order_preserving(true);
-            let properties = expr.get_properties(std::slice::from_ref(&child))?;
+            let properties = expr
+                .get_properties(std::slice::from_ref(&child))
+                .expect("cast properties");
             assert_eq!(properties.sort_properties, child.sort_properties);
             assert!(properties.strictly_order_preserving);
             assert_eq!(properties.range.data_type(), *expected.data_type());
 
-            let batch = RecordBatch::try_new(schema, vec![input])?;
-            let actual = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
+            let batch =
+                RecordBatch::try_new(schema, vec![input]).expect("valid input batch");
+            let actual = expr
+                .evaluate(&batch)
+                .expect("cast succeeds")
+                .into_array(batch.num_rows())
+                .expect("array result");
             assert_eq!(actual.as_ref(), expected.as_ref());
         }
-        Ok(())
     }
 
     #[test]

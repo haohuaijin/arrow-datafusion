@@ -2274,7 +2274,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_project_statistics_non_monotonic_cast() -> Result<()> {
+    fn test_project_statistics_non_monotonic_cast() {
         let input_schema = Schema::new(vec![Field::new("a", DataType::Utf8, false)]);
         let mut stats = Statistics::new_unknown(&input_schema);
         stats.num_rows = Precision::Exact(3);
@@ -2290,25 +2290,35 @@ pub(crate) mod tests {
             alias: "x".to_string(),
         }]);
         let out = projection
-            .project_statistics(stats, &projection.project_schema(&input_schema)?)?;
+            .project_statistics(
+                stats,
+                &projection
+                    .project_schema(&input_schema)
+                    .expect("valid projection schema"),
+            )
+            .expect("statistics projection succeeds");
         let batch = RecordBatch::try_new(
             Arc::new(input_schema),
             vec![Arc::new(arrow::array::StringArray::from(vec![
                 "1", "100", "2",
             ]))],
-        )?;
-        let actual = expr.evaluate(&batch)?.into_array(3)?;
+        )
+        .expect("valid input batch");
+        let actual = expr
+            .evaluate(&batch)
+            .expect("cast succeeds")
+            .into_array(3)
+            .expect("array result");
         assert_eq!(out.column_statistics[0].max_value, Precision::Absent);
         assert_eq!(out.column_statistics[0].min_value, Precision::Absent);
         assert_eq!(
-            ScalarValue::try_from_array(&actual, 1)?,
+            ScalarValue::try_from_array(&actual, 1).expect("valid scalar value"),
             ScalarValue::Int32(Some(100))
         );
-        Ok(())
     }
 
     #[test]
-    fn test_project_statistics_narrowing_cast_requires_safe_bounds() -> Result<()> {
+    fn test_project_statistics_narrowing_cast_requires_safe_bounds() {
         let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
         for (lower, upper, exact, safe) in [
             (-100, 100, true, true),
@@ -2335,7 +2345,13 @@ pub(crate) mod tests {
                 "x",
             )]);
             let output = projection
-                .project_statistics(stats, &projection.project_schema(&schema)?)?;
+                .project_statistics(
+                    stats,
+                    &projection
+                        .project_schema(&schema)
+                        .expect("valid projection schema"),
+                )
+                .expect("statistics projection succeeds");
             if safe {
                 assert_eq!(
                     output.column_statistics[0].min_value,
@@ -2349,7 +2365,6 @@ pub(crate) mod tests {
                 assert_eq!(output.column_statistics[0], ColumnStatistics::new_unknown());
             }
         }
-        Ok(())
     }
 
     fn get_stats() -> Statistics {
