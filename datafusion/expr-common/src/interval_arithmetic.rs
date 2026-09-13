@@ -422,9 +422,43 @@ impl Interval {
         data_type: &DataType,
         cast_options: &CastOptions,
     ) -> Result<Self> {
+        let source_type = self.data_type();
+        // An unbounded integer endpoint still has a finite limit imposed by its
+        // type. Preserve that limit when widening so subsequent arithmetic can
+        // prove that it does not overflow the destination type.
+        use DataType::{Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64};
+        let widening_integer_cast = matches!(
+            (&source_type, data_type),
+            (Int8, Int16 | Int32 | Int64)
+                | (Int16, Int32 | Int64)
+                | (Int32, Int64)
+                | (UInt8, UInt16 | UInt32 | UInt64 | Int16 | Int32 | Int64)
+                | (UInt16, UInt32 | UInt64 | Int32 | Int64)
+                | (UInt32, UInt64 | Int64)
+        );
+        let lower = if widening_integer_cast && self.lower.is_null() {
+            get_extreme_value!(
+                MIN,
+                MIN_DECIMAL128_FOR_EACH_PRECISION,
+                MIN_DECIMAL256_FOR_EACH_PRECISION,
+                &source_type
+            )
+        } else {
+            self.lower.clone()
+        };
+        let upper = if widening_integer_cast && self.upper.is_null() {
+            get_extreme_value!(
+                MAX,
+                MAX_DECIMAL128_FOR_EACH_PRECISION,
+                MAX_DECIMAL256_FOR_EACH_PRECISION,
+                &source_type
+            )
+        } else {
+            self.upper.clone()
+        };
         Self::try_new(
-            cast_scalar_value(&self.lower, data_type, cast_options)?,
-            cast_scalar_value(&self.upper, data_type, cast_options)?,
+            cast_scalar_value(&lower, data_type, cast_options)?,
+            cast_scalar_value(&upper, data_type, cast_options)?,
         )
     }
 
@@ -2355,6 +2389,63 @@ mod tests {
             assert_eq!(prev_value(inf.clone()), inf);
         });
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_widening_integer_cast_bounds() -> Result<()> {
+        use DataType::{Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64};
+        use arrow::compute::CastOptions;
+
+        let types = [
+            (Int8, i8::MIN as i128, i8::MAX as i128),
+            (Int16, i16::MIN as i128, i16::MAX as i128),
+            (Int32, i32::MIN as i128, i32::MAX as i128),
+            (Int64, i64::MIN as i128, i64::MAX as i128),
+            (UInt8, 0, u8::MAX as i128),
+            (UInt16, 0, u16::MAX as i128),
+            (UInt32, 0, u32::MAX as i128),
+            (UInt64, 0, u64::MAX as i128),
+        ];
+        for (source, min, max) in &types {
+            for (target, target_min, target_max) in &types {
+                if source == target || min < target_min || max > target_max {
+                    continue;
+                }
+                // Every source that can widen fits in Int64.
+                let lower = ScalarValue::Int64(Some(*min as i64)).cast_to(source)?;
+                let upper = ScalarValue::Int64(Some(*max as i64)).cast_to(source)?;
+                let zero = ScalarValue::new_zero(source)?;
+                let unbounded = ScalarValue::try_from(source)?;
+                for (lo, hi, expected_lo, expected_hi) in [
+                    (
+                        unbounded.clone(),
+                        unbounded.clone(),
+                        lower.clone(),
+                        upper.clone(),
+                    ),
+                    (zero.clone(), unbounded.clone(), zero.clone(), upper.clone()),
+                    (unbounded.clone(), zero.clone(), lower.clone(), zero.clone()),
+                    (zero.clone(), zero.clone(), zero.clone(), zero.clone()),
+                ] {
+                    let actual = Interval::try_new(lo, hi)?
+                        .cast_to(target, &CastOptions::default())?;
+                    let expected = Interval::try_new(
+                        expected_lo.cast_to(target)?,
+                        expected_hi.cast_to(target)?,
+                    )?;
+                    assert_eq!(actual, expected, "{source:?} -> {target:?}");
+                }
+            }
+        }
+        // Same-type and narrowing casts retain their existing unbounded behavior.
+        let unbounded = Interval::make_unbounded(&Int64)?;
+        for target in [Int64, Int32] {
+            assert_eq!(
+                unbounded.cast_to(&target, &CastOptions::default())?,
+                Interval::make_unbounded(&target)?
+            );
+        }
         Ok(())
     }
 

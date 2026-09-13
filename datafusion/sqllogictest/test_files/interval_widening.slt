@@ -1,0 +1,67 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Widening Int32 to Int64 preserves the source type's upper bound.
+statement ok
+SET datafusion.execution.target_partitions = 1;
+
+statement ok
+SET datafusion.explain.physical_plan_only = true;
+
+statement ok
+CREATE TABLE widening_input (a INT) AS
+VALUES (2147483647), (1), (2147483646), (2147483647);
+
+# The predicate implies a = Int32::MAX, so ORDER BY a needs no sort.
+query TT
+EXPLAIN SELECT a FROM widening_input
+WHERE CAST(a AS BIGINT) + 1 > 2147483647 ORDER BY a;
+----
+physical_plan
+01)FilterExec: CAST(a@0 AS Int64) + 1 > 2147483647
+02)--DataSourceExec: partitions=1, partition_sizes=[1]
+
+query I
+SELECT a FROM widening_input
+WHERE CAST(a AS BIGINT) + 1 > 2147483647 ORDER BY a;
+----
+2147483647
+2147483647
+
+# Two distinct values can pass this predicate; the sort must remain.
+query TT
+EXPLAIN SELECT a FROM widening_input
+WHERE CAST(a AS BIGINT) + 1 > 2147483646 ORDER BY a;
+----
+physical_plan
+01)SortExec: expr=[a@0 ASC NULLS LAST], preserve_partitioning=[false]
+02)--FilterExec: CAST(a@0 AS Int64) + 1 > 2147483646
+03)----DataSourceExec: partitions=1, partition_sizes=[1]
+
+query I
+SELECT a FROM widening_input
+WHERE CAST(a AS BIGINT) + 1 > 2147483646 ORDER BY a;
+----
+2147483646
+2147483647
+2147483647
+
+statement ok
+SET datafusion.execution.target_partitions = 4;
+
+statement ok
+RESET datafusion.explain.physical_plan_only;
